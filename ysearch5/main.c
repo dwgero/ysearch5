@@ -19,6 +19,12 @@
 #include <sched.h>
 #include <inttypes.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#elif defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#endif
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -202,6 +208,9 @@ _Atomic(uint_fast32_t) maxlenstep;
 char bufmaxlen[MAXBUF + 1];
 
 pthread_mutex_t printlock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t infinitefilelock = PTHREAD_MUTEX_INITIALIZER;
+FILE *infinitefile;
+char *infinitepath;
 
 // Allocator state changes on every cell allocation/free. Keep it private to
 // each worker so independent evaluators do not contend for one cache line.
@@ -240,10 +249,22 @@ _Static_assert((MEMO_BIT & (MEMO_BIT - 1)) == 0,
                "MEMO_BIT must be the highest value bit");
 _Static_assert((uint_fast32_t)MAXARRAY < MEMO_BIT,
                "arena indices must fit below MEMO_BIT");
+typedef uint64_t PackedKey;
+
+typedef struct {
+    PackedKey *keys;
+    size_t capacity;
+    size_t size;
+} PackedKeySet;
+
+static PackedKeySet neverendingset;
+static void loadinfinitecatalog(FILE *file);
+static void destroypackedkeyset(PackedKeySet *set);
 
 _Atomic(uint_fast32_t) repeatcount = 0;
 _Atomic(uint_fast32_t) nevercount = 0;
 _Atomic(uint_fast32_t) totalinfinitecount = 0;
+_Atomic(uint_fast32_t) neverendsmatch = 0;
 _Atomic(uint_fast32_t) checked = 0;
 atomic_int initdone = 0;
 
@@ -273,6 +294,211 @@ atomic_int masterwaiting = 0;
 WorkBatch workbatch[MAXTHREADS];
 char threadname[MAXTHREADS][32];
 #endif
+
+static char *getexecutablepath(const char *argv0)
+{
+    (void)argv0;
+
+#if defined(__APPLE__)
+    uint32_t capacity = 1024;
+    char *path = malloc(capacity);
+
+    if (path == NULL) {
+        fprintf(stderr, "failed to allocate executable path\n");
+        exit(EXIT_FAILURE);
+    }
+    for (;;) {
+        uint32_t required = capacity;
+
+        if (_NSGetExecutablePath(path, &required) == 0) break;
+        char *larger = realloc(path, required);
+
+        if (larger == NULL) {
+            free(path);
+            fprintf(stderr, "failed to allocate executable path\n");
+            exit(EXIT_FAILURE);
+        }
+        path = larger;
+        capacity = required;
+    }
+    char *resolved = realpath(path, NULL);
+
+    if (resolved == NULL) {
+        fprintf(stderr, "failed to resolve executable path %s: %s\n",
+                path, strerror(errno));
+        free(path);
+        exit(EXIT_FAILURE);
+    }
+    free(path);
+    return resolved;
+#elif defined(_WIN32) || defined(_WIN64)
+    DWORD capacity = 256;
+
+    for (;;) {
+        char *path = malloc((size_t)capacity);
+
+        if (path == NULL) {
+            fprintf(stderr, "failed to allocate executable path\n");
+            exit(EXIT_FAILURE);
+        }
+        DWORD length = GetModuleFileNameA(NULL, path, capacity);
+
+        if (length == 0) {
+            DWORD error = GetLastError();
+
+            free(path);
+            fprintf(stderr,
+                    "GetModuleFileNameA failed with error %lu\n",
+                    (unsigned long)error);
+            exit(EXIT_FAILURE);
+        }
+        if (length < capacity) return path;
+        free(path);
+        if (capacity > (UINT32_MAX / 2U)) {
+            fprintf(stderr, "executable path is too long\n");
+            exit(EXIT_FAILURE);
+        }
+        capacity *= 2U;
+    }
+#elif defined(__linux__)
+    size_t capacity = 256;
+
+    for (;;) {
+        char *path = malloc(capacity + 1U);
+
+        if (path == NULL) {
+            fprintf(stderr, "failed to allocate executable path\n");
+            exit(EXIT_FAILURE);
+        }
+        ssize_t length = readlink("/proc/self/exe", path, capacity);
+
+        if (length < 0) {
+            fprintf(stderr, "failed to read executable path: %s\n",
+                    strerror(errno));
+            free(path);
+            exit(EXIT_FAILURE);
+        }
+        if ((size_t)length < capacity) {
+            path[length] = '\0';
+            return path;
+        }
+        free(path);
+        if (capacity > (SIZE_MAX / 2U)) {
+            fprintf(stderr, "executable path is too long\n");
+            exit(EXIT_FAILURE);
+        }
+        capacity *= 2U;
+    }
+#else
+    if ((argv0 == NULL) || (*argv0 == '\0')) {
+        fprintf(stderr, "cannot determine executable path\n");
+        exit(EXIT_FAILURE);
+    }
+    char *path = realpath(argv0, NULL);
+
+    if (path == NULL) {
+        fprintf(stderr, "failed to resolve executable path %s: %s\n",
+                argv0, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    return path;
+#endif
+}
+
+static void openinfinitefile(const char *argv0)
+{
+    static const char filename[] = "infinite.cmb";
+    char *executable = getexecutablepath(argv0);
+    char *separator = strrchr(executable, '/');
+
+#if defined(_WIN32) || defined(_WIN64)
+    char *backslash = strrchr(executable, '\\');
+
+    if ((backslash != NULL) &&
+        ((separator == NULL) || (backslash > separator))) {
+        separator = backslash;
+    }
+#endif
+    size_t directorylength = (separator == NULL)
+        ? 0U
+        : (size_t)(separator - executable) + 1U;
+
+    if (directorylength > (SIZE_MAX - sizeof(filename))) {
+        free(executable);
+        fprintf(stderr, "infinite.cmb path is too long\n");
+        exit(EXIT_FAILURE);
+    }
+    infinitepath = malloc(directorylength + sizeof(filename));
+    if (infinitepath == NULL) {
+        free(executable);
+        fprintf(stderr, "failed to allocate infinite.cmb path\n");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(infinitepath, executable, directorylength);
+    memcpy(infinitepath + directorylength, filename, sizeof(filename));
+    free(executable);
+
+    // An existing catalogue is an immutable cache for this run. Only a
+    // missing catalogue enables output, so cached data is never truncated.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        errno = 0;
+        FILE *input = fopen(infinitepath, "r");
+
+        if (input != NULL) {
+            loadinfinitecatalog(input);
+            errno = 0;
+            if (fclose(input) != 0) {
+                int error = errno ? errno : EIO;
+
+                fprintf(stderr, "failed to close %s after reading: %s\n",
+                        infinitepath, strerror(error));
+                exit(EXIT_FAILURE);
+            }
+            return;
+        }
+        int error = errno;
+
+        if (error != ENOENT) {
+            fprintf(stderr, "failed to open %s for reading: %s\n",
+                    infinitepath, strerror(error));
+            exit(EXIT_FAILURE);
+        }
+
+        errno = 0;
+        infinitefile = fopen(infinitepath, "wx");
+        if (infinitefile != NULL) return;
+        error = errno;
+        if ((error == EEXIST) && (attempt == 0)) continue;
+
+        fprintf(stderr, "failed to create %s: %s\n",
+                infinitepath, strerror(error ? error : EIO));
+        exit(EXIT_FAILURE);
+    }
+
+    fprintf(stderr, "failed to initialize %s\n", infinitepath);
+    exit(EXIT_FAILURE);
+}
+
+static int closeinfinitefile(void)
+{
+    int result = EXIT_SUCCESS;
+
+    if (infinitefile != NULL) {
+        errno = 0;
+        if (fclose(infinitefile) != 0) {
+            int error = errno ? errno : EIO;
+
+            fprintf(stderr, "failed to close %s: %s\n",
+                    infinitepath, strerror(error));
+            result = EXIT_FAILURE;
+        }
+        infinitefile = NULL;
+    }
+    destroypackedkeyset(&neverendingset);
+    free(infinitepath);
+    infinitepath = NULL;
+    return result;
+}
 
 // things that can return 0:
 // next[]
@@ -1192,6 +1418,366 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
         cell1 = next[cell1];
         cell2 = next[cell2];
     }
+}
+
+// A packed key is the exact two-bit preorder grammar in its low 58 bits,
+// with the payload width in the high six bits. Application is token zero, so
+// storing the width is what preserves leading application tokens.
+#define PACKED_KEY_LENGTH_BITS 6U
+#define PACKED_KEY_LENGTH_SHIFT (64U - PACKED_KEY_LENGTH_BITS)
+#define PACKED_KEY_PAYLOAD_BITS PACKED_KEY_LENGTH_SHIFT
+#define PACKED_KEY_PAYLOAD_MASK (UINT64_MAX >> PACKED_KEY_LENGTH_BITS)
+#define PACKED_KEY_TOKEN_BITS 2U
+#define PACKED_TOKEN_APPLICATION UINT64_C(0)
+#define PACKED_TOKEN_S UINT64_C(1)
+#define PACKED_TOKEN_K UINT64_C(2)
+#define PACKED_TOKEN_X UINT64_C(3)
+#define PACKED_LEAF_KEY(token) \
+    ((((PackedKey)PACKED_KEY_TOKEN_BITS) << PACKED_KEY_LENGTH_SHIFT) | \
+     (PackedKey)(token))
+#define PACKED_KEY_S PACKED_LEAF_KEY(PACKED_TOKEN_S)
+#define PACKED_KEY_K PACKED_LEAF_KEY(PACKED_TOKEN_K)
+#define PACKED_KEY_X PACKED_LEAF_KEY(PACKED_TOKEN_X)
+
+_Static_assert(PACKED_TOKEN_APPLICATION == 0,
+               "packed application token must be zero");
+_Static_assert(((4U * MAXLEN) - 2U) <= PACKED_KEY_PAYLOAD_BITS,
+               "MAXLEN expressions must fit in packed keys");
+
+static inline unsigned packedkeybits(PackedKey key) {
+    return (unsigned)(key >> PACKED_KEY_LENGTH_SHIFT);
+}
+
+#if PARANOID
+static int validpackedkey(PackedKey key) {
+    unsigned bits = packedkeybits(key);
+    PackedKey payload = key & PACKED_KEY_PAYLOAD_MASK;
+
+    if ((bits < PACKED_KEY_TOKEN_BITS) ||
+        (bits > PACKED_KEY_PAYLOAD_BITS) ||
+        ((bits % PACKED_KEY_TOKEN_BITS) != 0)) {
+        return 0;
+    }
+    return (bits == PACKED_KEY_PAYLOAD_BITS) || ((payload >> bits) == 0);
+}
+#endif
+
+static inline PackedKey packedapplicationkey(PackedKey left,
+                                              PackedKey right) {
+    unsigned leftbits = packedkeybits(left);
+    unsigned rightbits = packedkeybits(right);
+    unsigned resultbits = PACKED_KEY_TOKEN_BITS + leftbits + rightbits;
+
+#if PARANOID
+    if (!validpackedkey(left) || !validpackedkey(right)) {
+        fprintf(stderr, "invalid packed combinator key\n");
+        INT3
+        exit(EXIT_FAILURE);
+    }
+#endif
+    if (resultbits > PACKED_KEY_PAYLOAD_BITS) {
+        fprintf(stderr,
+                "combinator exceeds packed-key capacity of %u bits\n",
+                PACKED_KEY_PAYLOAD_BITS);
+        exit(EXIT_FAILURE);
+    }
+    PackedKey payload =
+        ((left & PACKED_KEY_PAYLOAD_MASK) << rightbits) |
+        (right & PACKED_KEY_PAYLOAD_MASK);
+
+    return ((PackedKey)resultbits << PACKED_KEY_LENGTH_SHIFT) | payload;
+}
+
+#define INITIAL_PACKED_KEY_CAPACITY 1024U
+_Static_assert((INITIAL_PACKED_KEY_CAPACITY &
+                (INITIAL_PACKED_KEY_CAPACITY - 1U)) == 0,
+               "initial packed-key capacity must be a power of two");
+
+static inline size_t packedkeyhash(PackedKey key, size_t mask) {
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    key ^= key >> 33;
+    key *= UINT64_C(0xc4ceb9fe1a85ec53);
+    key ^= key >> 33;
+    return (size_t)key & mask;
+}
+
+static void initializepackedkeyset(PackedKeySet *set) {
+    set->keys = calloc(INITIAL_PACKED_KEY_CAPACITY,
+                       sizeof(*set->keys));
+    if (set->keys == NULL) {
+        fprintf(stderr, "failed to allocate packed-key set for %s\n",
+                infinitepath);
+        exit(EXIT_FAILURE);
+    }
+    set->capacity = INITIAL_PACKED_KEY_CAPACITY;
+    set->size = 0;
+}
+
+static void growpackedkeyset(PackedKeySet *set) {
+    if ((set->capacity > (SIZE_MAX / 2U)) ||
+        ((set->capacity * 2U) > (SIZE_MAX / sizeof(*set->keys)))) {
+        fprintf(stderr, "packed-key set for %s is too large\n", infinitepath);
+        exit(EXIT_FAILURE);
+    }
+    size_t newcapacity = set->capacity * 2U;
+    PackedKey *newkeys = calloc(newcapacity, sizeof(*newkeys));
+
+    if (newkeys == NULL) {
+        fprintf(stderr, "failed to grow packed-key set for %s\n",
+                infinitepath);
+        exit(EXIT_FAILURE);
+    }
+    size_t mask = newcapacity - 1U;
+
+    for (size_t oldindex = 0; oldindex < set->capacity; ++oldindex) {
+        PackedKey key = set->keys[oldindex];
+
+        if (key == 0) continue;
+        size_t newindex = packedkeyhash(key, mask);
+        while (newkeys[newindex] != 0) {
+            newindex = (newindex + 1U) & mask;
+        }
+        newkeys[newindex] = key;
+    }
+    free(set->keys);
+    set->keys = newkeys;
+    set->capacity = newcapacity;
+}
+
+static int packedkeysetinsert(PackedKeySet *set, PackedKey key) {
+    if (key == 0) {
+        fprintf(stderr, "cannot insert an empty packed key from %s\n",
+                infinitepath);
+        exit(EXIT_FAILURE);
+    }
+    size_t mask = set->capacity - 1U;
+    size_t index = packedkeyhash(key, mask);
+
+    while (set->keys[index] != 0) {
+        if (set->keys[index] == key) return 0;
+        index = (index + 1U) & mask;
+    }
+    if (set->size >= (set->capacity / 2U)) {
+        growpackedkeyset(set);
+        return packedkeysetinsert(set, key);
+    }
+    set->keys[index] = key;
+    set->size++;
+    return 1;
+}
+
+static int packedkeysetcontains(const PackedKeySet *set, PackedKey key) {
+    if ((set->keys == NULL) || (key == 0)) return 0;
+    size_t mask = set->capacity - 1U;
+    size_t index = packedkeyhash(key, mask);
+    size_t start = index;
+
+    while (set->keys[index] != 0) {
+        if (set->keys[index] == key) return 1;
+        index = (index + 1U) & mask;
+        if (index == start) break;
+    }
+    return 0;
+}
+
+static void destroypackedkeyset(PackedKeySet *set) {
+    free(set->keys);
+    set->keys = NULL;
+    set->capacity = 0;
+    set->size = 0;
+}
+
+_Noreturn static void invalidcatalogline(size_t linenumber,
+                                         const char *message) {
+    fprintf(stderr, "invalid %s line %zu: %s\n",
+            infinitepath, linenumber, message);
+    exit(EXIT_FAILURE);
+}
+
+static int hexvalue(unsigned char character) {
+    if ((character >= '0') && (character <= '9')) {
+        return (int)(character - '0');
+    }
+    if ((character >= 'a') && (character <= 'f')) {
+        return (int)(character - 'a') + 10;
+    }
+    if ((character >= 'A') && (character <= 'F')) {
+        return (int)(character - 'A') + 10;
+    }
+    return -1;
+}
+
+static PackedKey parsecatalogexpression(const char **position,
+                                         size_t linenumber) {
+    PackedKey result = 0;
+
+    while ((**position != '\0') && (**position != ')')) {
+        PackedKey term;
+
+        if (**position == 'S') {
+            term = PACKED_KEY_S;
+            (*position)++;
+        } else if (**position == 'K') {
+            term = PACKED_KEY_K;
+            (*position)++;
+        } else if (**position == '(') {
+            (*position)++;
+            term = parsecatalogexpression(position, linenumber);
+            if (**position != ')') {
+                invalidcatalogline(linenumber, "missing closing parenthesis");
+            }
+            (*position)++;
+        } else {
+            invalidcatalogline(linenumber,
+                               "expression contains an invalid character");
+        }
+
+        if (result == 0) {
+            result = term;
+        } else {
+            unsigned resultbits = PACKED_KEY_TOKEN_BITS +
+                packedkeybits(result) + packedkeybits(term);
+
+            if (resultbits > PACKED_KEY_PAYLOAD_BITS) {
+                invalidcatalogline(linenumber,
+                                   "expression exceeds packed-key capacity");
+            }
+            result = packedapplicationkey(result, term);
+        }
+    }
+    if (result == 0) {
+        invalidcatalogline(linenumber, "expression is empty");
+    }
+    return result;
+}
+
+#define INFINITE_CATALOG_LINE_CAPACITY 128U
+
+static void loadinfinitecatalog(FILE *file) {
+    char line[INFINITE_CATALOG_LINE_CAPACITY];
+    size_t linenumber = 0;
+
+    initializepackedkeyset(&neverendingset);
+    for (;;) {
+        errno = 0;
+        if (fgets(line, (int)sizeof(line), file) == NULL) {
+            if (ferror(file)) {
+                int error = errno ? errno : EIO;
+
+                fprintf(stderr, "failed to read %s after line %zu: %s\n",
+                        infinitepath, linenumber, strerror(error));
+                exit(EXIT_FAILURE);
+            }
+            break;
+        }
+        linenumber++;
+        size_t length = strlen(line);
+
+        if ((length == 0) || (line[length - 1U] != '\n')) {
+            invalidcatalogline(linenumber,
+                               "line is overlong or not newline-terminated");
+        }
+        line[--length] = '\0';
+        if ((length != 0) && (line[length - 1U] == '\r')) {
+            line[--length] = '\0';
+        }
+        if ((length < 21U) || (line[0] != '0') || (line[1] != 'x') ||
+            (line[18] != ':') || (line[19] != ' ')) {
+            invalidcatalogline(linenumber,
+                               "expected 0x<16 hex digits>: <SK expression>");
+        }
+        PackedKey recordedkey = 0;
+
+        for (size_t i = 2; i < 18; ++i) {
+            int digit = hexvalue((unsigned char)line[i]);
+
+            if (digit < 0) {
+                invalidcatalogline(linenumber,
+                                   "packed key contains a non-hex digit");
+            }
+            recordedkey = (recordedkey << 4) | (PackedKey)(unsigned)digit;
+        }
+        const char *position = line + 20;
+        PackedKey expressionkey = parsecatalogexpression(&position,
+                                                          linenumber);
+
+        if (*position != '\0') {
+            invalidcatalogline(linenumber,
+                               "expression has an unmatched parenthesis");
+        }
+        if (recordedkey != expressionkey) {
+            invalidcatalogline(linenumber,
+                               "packed key does not match expression");
+        }
+        (void)packedkeysetinsert(&neverendingset, recordedkey);
+    }
+}
+
+static PackedKey cellcontentpackedkey(uint_fast32_t value);
+
+static PackedKey cells2packedkey(uint_fast32_t tail) {
+    uint_fast32_t cell = next[tail];
+    PackedKey key = cellcontentpackedkey(contents[cell]);
+
+    while (cell != tail) {
+        cell = next[cell];
+        key = packedapplicationkey(key,
+                                   cellcontentpackedkey(contents[cell]));
+    }
+    return key;
+}
+
+static PackedKey cellcontentpackedkey(uint_fast32_t value) {
+    if (value >= FREEMIN) return cells2packedkey(resolvedtail(value));
+    if (value == 'S') return PACKED_KEY_S;
+    if (value == 'K') return PACKED_KEY_K;
+    if (value == 'x') return PACKED_KEY_X;
+    fprintf(stderr, "cannot pack character value %" PRIuFAST32 "\n", value);
+    exit(EXIT_FAILURE);
+}
+
+static PackedKey cells2packedkeywithoutfinal(uint_fast32_t tail) {
+    uint_fast32_t cell = next[tail];
+    PackedKey key = cellcontentpackedkey(contents[cell]);
+
+    while (next[cell] != tail) {
+        cell = next[cell];
+        key = packedapplicationkey(key,
+                                   cellcontentpackedkey(contents[cell]));
+    }
+    return key;
+}
+
+static void writeinfinitecombinator(uint_fast32_t bufferhead,
+                                    const char *buffer) {
+    if (infinitefile == NULL) return;
+
+    size_t length = strlen(buffer);
+
+    if ((length == 0) || (length > MAXBUF) ||
+        (buffer[length - 1U] != 'x') || (contents[bufferhead] != 'x')) {
+        fprintf(stderr, "cannot write malformed divergent combinator %s\n",
+                buffer);
+        exit(EXIT_FAILURE);
+    }
+    PackedKey key = cells2packedkeywithoutfinal(bufferhead);
+
+    pthread_mutex_lock(&infinitefilelock);
+    errno = 0;
+    if (fprintf(infinitefile, "0x%016" PRIx64 ": %.*s\n",
+                (uint64_t)key, (int)(length - 1U), buffer) < 0) {
+        int error = errno ? errno : EIO;
+        FILE *failedfile = infinitefile;
+
+        infinitefile = NULL;
+        (void)fclose(failedfile);
+        fprintf(stderr, "failed to write %s: %s\n",
+                infinitepath, strerror(error));
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    pthread_mutex_unlock(&infinitefilelock);
 }
 
 typedef struct {
@@ -2123,6 +2709,7 @@ reductionobserved:
         }
     } else {
         if (repeatsforever) {
+            writeinfinitecombinator(bufferhead, buffer);
             (void)atomic_fetch_add(&totalinfinitecount, 1);
             if (repeatsforever == 1) {
                 (void)atomic_fetch_add(&repeatcount, 1);
@@ -2152,6 +2739,7 @@ reductionobserved:
                 }
             }
         } else if (steps >= MAXSTEPS) {
+            writeinfinitecombinator(bufferhead, buffer);
             (void)atomic_fetch_add(&totalinfinitecount, 1);
             (void)atomic_fetch_add(&nevercount, 1);
             if (length <= 6) {
@@ -2258,6 +2846,17 @@ int decodenumerictree(unsigned length, uint_fast32_t num, NumericNode *nodes) {
 
 unsigned char numericnodesymbol(const NumericNode *node, unsigned count) {
     return ((node->skbit >= 0) && (count & (1U << node->skbit))) ? 'K' : 'S';
+}
+
+static PackedKey numericnodepackedkey(const NumericNode *nodes, int root,
+                                      unsigned count) {
+    if (nodes[root].left < 0) {
+        return numericnodesymbol(&nodes[root], count) == 'K'
+            ? PACKED_KEY_K : PACKED_KEY_S;
+    }
+    return packedapplicationkey(
+        numericnodepackedkey(nodes, nodes[root].left, count),
+        numericnodepackedkey(nodes, nodes[root].right, count));
 }
 
 int numericnodehasKorSK(const NumericNode *nodes, int root,
@@ -2515,6 +3114,13 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
                                count, 1)) {
             continue;
         }
+        if ((neverendingset.size != 0) &&
+            packedkeysetcontains(
+                &neverendingset,
+                numericnodepackedkey(numericnodes, numericroot, count))) {
+            (void)atomic_fetch_add(&neverendsmatch, 1);
+            continue;
+        }
         setSKbuffer(length, count, buffer, index);
         if (((atomic_fetch_add(&checked, 1) + 1) % 1000) == 0) {
             pthread_mutex_lock(&printlock);
@@ -2740,6 +3346,7 @@ void threadfinal(void) {
             fprintf(stderr, "pthread_join of thread %d failed: ", i);
             perror(NULL);
             INT3
+            _Exit(EXIT_FAILURE);
         }
     }
     if (sem_close(mastersem) != 0) {
@@ -2757,7 +3364,10 @@ void threadfinal(void) {
 }
 #endif // !SINGLE_THREAD
 
-int main(void) {
+int main(int argc, char **argv) {
+    (void)argc;
+    openinfinitefile(argv[0]);
+
 #if SINGLE_THREAD
     nxt[0] = malloc(MAXARRAY * sizeof(uint_fast32_t));
     if (nxt[0] == NULL) {
@@ -2945,8 +3555,13 @@ int main(void) {
             printf("Repeats forever:%" PRIuFAST32 "", rptcnt);
         }
         putchar('\n');
-        printf("Total infinites:%" PRIuFAST32 "\n",
+        printf("Total infinites:%" PRIuFAST32,
                atomic_load(&totalinfinitecount));
+        if (neverendingset.keys != NULL) {
+            printf(" Infinite matches:%" PRIuFAST32,
+                   atomic_load(&neverendsmatch));
+        }
+        putchar('\n');
 #endif // PRINTMAXES
         fflush(stdout);
     }
@@ -2954,10 +3569,12 @@ int main(void) {
 #if !SINGLE_THREAD
     threadfinal();
 #endif
+    int result = closeinfinitefile();
+
     freememopath();
-    if (ISATTY(FILENO(stdin))) {
+    if ((result == EXIT_SUCCESS) && ISATTY(FILENO(stdin))) {
         puts("\nPress any key to exit");
         getchar();
     }
-    return 0;
+    return result;
 }

@@ -45,8 +45,7 @@
     #define PERTHREAD __declspec(thread)
 #endif
 
-//#define MAXLEN 12
-#define MAXLEN 11
+#define MAXLEN 12
 #define MAXBUF ((3 * MAXLEN) - 1)
 #define MAXSTR maxstr
 #define MAXSTEPS maxsteps
@@ -173,15 +172,15 @@ static inline unsigned popcount32(uint32_t x)
 uint_fast32_t maxstrtable[12] = {
     // 0    1     2     3     4     5     6
     1024, 1024, 1024, 1024, 1024, 1024, 1024,
-    // 7     8       9      10       11
-    49152, 98304, 196608, 786432, 25165824
+    // 7    8     9    10    11
+    1024, 2048, 4096, 4096, 20480
 };
 
 uint_fast32_t maxsteptable[12] = {
     // 0    1     2     3     4     5     6
     1024, 1024, 1024, 1024, 1024, 1024, 1024,
-    // 7    8     9     10      11
-    2048, 4096, 8192, 32768, 1572864
+    // 7    8     9     10     11
+    2048, 2048, 4096, 10240, 2048000
 };
 
 _Static_assert(MAXLEN <= (sizeof(maxstrtable) / sizeof(maxstrtable[0])),
@@ -1199,7 +1198,7 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
 // Exact canonical keys store the two-bit preorder grammar in the low 58 bits
 // and its payload width in the high six bits. Leading application tokens are
 // therefore retained even though their value is zero.
-#define NEVERENDS_CAPACITY 131072U
+#define NEVERENDS_CAPACITY 1048576U
 #define EXPRESSION_KEY_LENGTH_BITS 6U
 #define EXPRESSION_KEY_LENGTH_SHIFT (64U - EXPRESSION_KEY_LENGTH_BITS)
 #define EXPRESSION_KEY_PAYLOAD_BITS EXPRESSION_KEY_LENGTH_SHIFT

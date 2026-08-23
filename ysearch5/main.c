@@ -1401,33 +1401,79 @@ typedef struct {
     uint_fast32_t tail;
 } CellSpan;
 
-typedef struct {
-    int exactsk;
-    int kapplication;
-    uint_fast32_t firstcell;
-    uint_fast32_t argumentcell;
-} SArgumentPattern;
+enum SArgumentShape {
+    S_ARGUMENT_ERROR = -1,
+    S_ARGUMENT_OTHER,
+    S_ARGUMENT_SINGLE_K,
+    S_ARGUMENT_EXACT_SK,
+    S_ARGUMENT_K_APPLICATION,
+    S_ARGUMENT_LEGACY_SK_APPLICATION
+};
 
-SArgumentPattern classifySargument(uint_fast32_t value) {
-    SArgumentPattern pattern = {0, 0, 0, 0};
+#define S_ARGUMENT_SHAPE_BITS 3U
+#define S_ARGUMENT_SHAPE_MASK ((1U << S_ARGUMENT_SHAPE_BITS) - 1U)
+_Static_assert(S_ARGUMENT_LEGACY_SK_APPLICATION <= S_ARGUMENT_SHAPE_MASK,
+               "S argument shapes do not fit their packed representation");
 
-    if (!isdirectcontents(value)) return pattern;
+static enum SArgumentShape classifySargumenttail(uint_fast32_t tail,
+                                                  int allowlegacy) {
+    uint_fast32_t first = next[tail];
 
-    uint_fast32_t first = next[value];
-
-    // The requested SK and K<any> patterns both contain exactly two
-    // top-level items.
-    if ((first == 0) || (first == value) || (next[first] != value)) {
-        return pattern;
+    if (first == 0) return S_ARGUMENT_OTHER;
+    if (first == tail) {
+        return contents[first] == 'K'
+            ? S_ARGUMENT_SINGLE_K : S_ARGUMENT_OTHER;
     }
-    pattern.firstcell = first;
-    pattern.argumentcell = value;
-    if ((contents[first] == 'S') && (contents[value] == 'K')) {
-        pattern.exactsk = 1;
-    } else if (contents[first] == 'K') {
-        pattern.kapplication = 1;
+
+    uint_fast32_t second = next[first];
+
+    if (second == 0) return S_ARGUMENT_OTHER;
+    if (second == tail) {
+        if ((contents[first] == 'S') && (contents[second] == 'K')) {
+            return S_ARGUMENT_EXACT_SK;
+        }
+        return contents[first] == 'K'
+            ? S_ARGUMENT_K_APPLICATION : S_ARGUMENT_OTHER;
     }
-    return pattern;
+    if (!allowlegacy || (next[second] != tail)) {
+        return S_ARGUMENT_OTHER;
+    }
+    return ((contents[first] == 'S') && (contents[second] == 'K'))
+        ? S_ARGUMENT_LEGACY_SK_APPLICATION : S_ARGUMENT_OTHER;
+}
+
+// Inspect an S argument once. Tagged shortcut shapes are made private here
+// because the shortcut code consumes their rings destructively. The returned
+// shape describes that private copy, so tryoptimizedS does not need to traverse
+// it again. A one-cell tagged K becomes the immediate K value.
+static inline enum SArgumentShape
+prepareSargument(uint_fast32_t cell, int allowlegacy) {
+    uint_fast32_t value = contents[cell];
+
+    if (value < FREEMIN) return S_ARGUMENT_OTHER;
+
+    uint_fast32_t tail = resolvedtail(value);
+    enum SArgumentShape shape =
+        classifySargumenttail(tail, allowlegacy);
+
+    if (shape == S_ARGUMENT_OTHER) return shape;
+    if (ismemocontents(value)) {
+        if (shape == S_ARGUMENT_SINGLE_K) {
+            releasecontents(value);
+            contents[cell] = 'K';
+            return S_ARGUMENT_OTHER;
+        }
+
+        uint_fast32_t copy = clonecells(tail);
+
+        if (copy == 0) return S_ARGUMENT_ERROR;
+        releasecontents(value);
+        contents[cell] = copy;
+    } else if (shape == S_ARGUMENT_SINGLE_K) {
+        // Preserve the existing treatment of a direct one-cell (K) ring.
+        return S_ARGUMENT_OTHER;
+    }
+    return shape;
 }
 
 CellSpan takeownedcell(uint_fast32_t cell) {
@@ -1479,10 +1525,14 @@ void finishSspan(CellSpan span, uint_fast32_t rest,
 
 int tryoptimizedS(uint_fast32_t scell,
                   uint_fast32_t xcell, uint_fast32_t x,
-                  uint_fast32_t ycell, uint_fast32_t y,
+                  uint_fast32_t ycell, unsigned packedshapes,
                   uint_fast32_t zcell, uint_fast32_t rest,
                   uint_fast32_t *resulthead, uint_fast32_t *resulttail,
                   uint_fast32_t *additionalsteps) {
+    enum SArgumentShape xshape =
+        (enum SArgumentShape)(packedshapes & S_ARGUMENT_SHAPE_MASK);
+    enum SArgumentShape yshape =
+        (enum SArgumentShape)(packedshapes >> S_ARGUMENT_SHAPE_BITS);
     // Every successful path below transfers or discards existing ownership.
     // None allocates, clones, or consults a memo table.
     if (x == 'K') {
@@ -1496,12 +1546,9 @@ int tryoptimizedS(uint_fast32_t scell,
         return 1;
     }
 
-    SArgumentPattern xpattern = classifySargument(x);
-    SArgumentPattern ypattern = classifySargument(y);
-
     // S (SK) y z -> y z.
-    if (xpattern.exactsk) {
-        if (ypattern.exactsk) {
+    if (xshape == S_ARGUMENT_EXACT_SK) {
+        if (yshape == S_ARGUMENT_EXACT_SK) {
             CellSpan result = makecanonicalSKKtop(xcell);
 
             putfree(scell);
@@ -1511,13 +1558,15 @@ int tryoptimizedS(uint_fast32_t scell,
             *additionalsteps = 2; // SK z (y z) -> y z
             return 1;
         }
-        if (ypattern.kapplication) {
-            CellSpan result = takeownedcell(ypattern.argumentcell);
+        if (yshape == S_ARGUMENT_K_APPLICATION) {
+            uint_fast32_t y = contents[ycell];
+            uint_fast32_t yfirst = next[y];
+            CellSpan result = takeownedcell(y);
 
             putfree(scell);
             discardownedcell(xcell);
             discardownedcell(zcell);
-            putfree(ypattern.firstcell);
+            putfree(yfirst);
             putfree(ycell);
             finishSspan(result, rest, resulthead, resulttail);
             *additionalsteps = 3; // SK eliminates x; K eliminates y
@@ -1536,11 +1585,12 @@ int tryoptimizedS(uint_fast32_t scell,
     }
 
     // S (K a) y z -> a (y z).
-    if (xpattern.kapplication) {
-        if (ypattern.exactsk) {
-            CellSpan result = takeownedcell(xpattern.argumentcell);
+    if (xshape == S_ARGUMENT_K_APPLICATION) {
+        if (yshape == S_ARGUMENT_EXACT_SK) {
+            uint_fast32_t xfirst = next[x];
+            CellSpan result = takeownedcell(x);
 
-            putfree(xpattern.firstcell);
+            putfree(xfirst);
             putfree(xcell);
             discardownedcell(zcell);
             makecanonicalSKKargument(ycell, scell);
@@ -1550,27 +1600,31 @@ int tryoptimizedS(uint_fast32_t scell,
             *additionalsteps = 1; // K<any> z -> <any>
             return 1;
         }
-        if (ypattern.kapplication) {
-            CellSpan result = takeownedcell(xpattern.argumentcell);
+        if (yshape == S_ARGUMENT_K_APPLICATION) {
+            uint_fast32_t y = contents[ycell];
+            uint_fast32_t xfirst = next[x];
+            uint_fast32_t yfirst = next[y];
+            CellSpan result = takeownedcell(x);
 
             putfree(scell);
-            putfree(xpattern.firstcell);
+            putfree(xfirst);
             putfree(xcell);
-            putfree(ypattern.firstcell);
+            putfree(yfirst);
             putfree(ycell);
             discardownedcell(zcell);
-            next[result.tail] = ypattern.argumentcell;
-            result.tail = ypattern.argumentcell;
+            next[result.tail] = y;
+            result.tail = y;
             finishSspan(result, rest, resulthead, resulttail);
             *additionalsteps = 2; // both K applications discard z
             return 1;
         }
 
-        CellSpan result = takeownedcell(xpattern.argumentcell);
+        uint_fast32_t xfirst = next[x];
+        CellSpan result = takeownedcell(x);
         CellSpan yz = takeownedcell(ycell);
 
         putfree(scell);
-        putfree(xpattern.firstcell);
+        putfree(xfirst);
         next[yz.tail] = zcell;
         next[zcell] = yz.head;
         contents[xcell] = zcell;
@@ -1582,7 +1636,7 @@ int tryoptimizedS(uint_fast32_t scell,
     }
 
     // S x (SK) z -> x z (SKK).
-    if (ypattern.exactsk) {
+    if (yshape == S_ARGUMENT_EXACT_SK) {
         CellSpan result = takeownedcell(xcell);
 
         makecanonicalSKKargument(ycell, scell);
@@ -1594,35 +1648,22 @@ int tryoptimizedS(uint_fast32_t scell,
         return 1;
     }
     // S x (K a) z -> x z a.
-    if (ypattern.kapplication) {
+    if (yshape == S_ARGUMENT_K_APPLICATION) {
+        uint_fast32_t y = contents[ycell];
+        uint_fast32_t yfirst = next[y];
         CellSpan result = takeownedcell(xcell);
 
         putfree(scell);
-        putfree(ypattern.firstcell);
+        putfree(yfirst);
         putfree(ycell);
         next[result.tail] = zcell;
-        next[zcell] = ypattern.argumentcell;
-        result.tail = ypattern.argumentcell;
+        next[zcell] = y;
+        result.tail = y;
         finishSspan(result, rest, resulthead, resulttail);
         *additionalsteps = 1; // K<any> z -> <any>
         return 1;
     }
     return 0;
-}
-
-static int islegacySKapplication(uint_fast32_t value) {
-    if (!isdirectcontents(value)) return 0;
-
-    uint_fast32_t first = next[value];
-    uint_fast32_t second;
-    uint_fast32_t third;
-
-    if ((first == 0) || (first == value)) return 0;
-    second = next[first];
-    if ((second == 0) || (second == value)) return 0;
-    third = next[second];
-    if (third != value) return 0;
-    return (contents[first] == 'S') && (contents[second] == 'K');
 }
 
 // Give zcell and duplicate one reference each to the same subexpression.
@@ -1652,47 +1693,6 @@ static int shareScontents(uint_fast32_t zcell, uint_fast32_t *duplicate) {
     return 1;
 }
 
-static int taggedSshortcutshape(uint_fast32_t value, int allowlegacy) {
-    if (!ismemocontents(value)) return 0;
-
-    uint_fast32_t tail = resolvedtail(value);
-    uint_fast32_t first = next[tail];
-
-    if (first == tail) return contents[first] == 'K';
-    uint_fast32_t second = next[first];
-    if (second == tail) {
-        return ((contents[first] == 'S') && (contents[second] == 'K')) ||
-               (contents[first] == 'K');
-    }
-    return allowlegacy && (next[second] == tail) &&
-           (contents[first] == 'S') && (contents[second] == 'K');
-}
-
-// Shortcut code consumes argument rings destructively. If a tagged argument
-// has a recognized shortcut shape, give this occurrence a private copy first.
-// A one-cell K target can become the immediate K value directly.
-static int prepareSshortcutargument(uint_fast32_t cell, int allowlegacy) {
-    uint_fast32_t value = contents[cell];
-
-    if (!taggedSshortcutshape(value, allowlegacy)) return 1;
-
-    uint_fast32_t target = resolvedtail(value);
-    uint_fast32_t first = next[target];
-
-    if ((first == target) && (contents[first] == 'K')) {
-        releasecontents(value);
-        contents[cell] = 'K';
-        return 1;
-    }
-
-    uint_fast32_t copy = clonecells(target);
-
-    if (copy == 0) return 0;
-    releasecontents(value);
-    contents[cell] = copy;
-    return 1;
-}
-
 // Reduce one S or K redex at the front of an open linear chain. The returned
 // cost includes contractions performed algebraically by the existing direct S
 // shortcuts. A zero result means weak-head form; -1 means arena exhaustion.
@@ -1717,19 +1717,29 @@ static int reducetop(uint_fast32_t *headptr, uint_fast32_t *tailptr,
         uint_fast32_t y;
         uint_fast32_t z = contents[zcell];
         uint_fast32_t optimizedsteps;
+        enum SArgumentShape xshape;
+        enum SArgumentShape yshape = S_ARGUMENT_OTHER;
 
-        if (!prepareSshortcutargument(xcell, 0)) return -1;
+        xshape = prepareSargument(xcell, 0);
+        if (xshape == S_ARGUMENT_ERROR) return -1;
         x = contents[xcell];
-        if ((x != 'K') && !prepareSshortcutargument(ycell, 1)) return -1;
-        y = contents[ycell];
+        if (x != 'K') {
+            yshape = prepareSargument(ycell, 1);
+            if (yshape == S_ARGUMENT_ERROR) return -1;
+        }
+        unsigned packedshapes =
+            (unsigned)xshape |
+            ((unsigned)yshape << S_ARGUMENT_SHAPE_BITS);
 
-        if (tryoptimizedS(head, xcell, x, ycell, y, zcell, rest, &head,
-                          &tail, &optimizedsteps)) {
+        if (tryoptimizedS(head, xcell, x, ycell, packedshapes, zcell, rest,
+                          &head, &tail, &optimizedsteps)) {
             *headptr = head;
             *tailptr = tail;
             *cost = optimizedsteps + 1;
             return 1;
         }
+
+        y = contents[ycell];
 
         uint_fast32_t xhead = xcell;
         uint_fast32_t xtail = xcell;
@@ -1737,7 +1747,7 @@ static int reducetop(uint_fast32_t *headptr, uint_fast32_t *tailptr,
         uint_fast32_t ytail = ycell;
         uint_fast32_t savey = ycell;
         uint_fast32_t needtofreex = 0;
-        int gotSK = islegacySKapplication(y);
+        int gotSK = yshape == S_ARGUMENT_LEGACY_SK_APPLICATION;
 
         if (isdirectcontents(x)) {
             needtofreex = xcell;

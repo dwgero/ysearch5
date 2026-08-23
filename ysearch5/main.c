@@ -1001,6 +1001,220 @@ uint32_t cells2idwithoutfinal(uint_fast32_t tail) {
     return expressionid;
 }
 
+typedef struct {
+    uint_fast32_t head;
+    uint_fast32_t tail;
+} CellSpan;
+
+typedef struct {
+    int exactsk;
+    int kapplication;
+    uint_fast32_t firstcell;
+    uint_fast32_t argumentcell;
+} SArgumentPattern;
+
+SArgumentPattern classifySargument(uint_fast32_t value) {
+    SArgumentPattern pattern = {0, 0, 0, 0};
+
+    if (value < FREEMIN) return pattern;
+
+    uint_fast32_t first = next[value];
+
+    // The requested SK and K<any> patterns both contain exactly two
+    // top-level items.
+    if ((first == 0) || (first == value) || (next[first] != value)) {
+        return pattern;
+    }
+    pattern.firstcell = first;
+    pattern.argumentcell = value;
+    if ((contents[first] == 'S') && (contents[value] == 'K')) {
+        pattern.exactsk = 1;
+    } else if (contents[first] == 'K') {
+        pattern.kapplication = 1;
+    }
+    return pattern;
+}
+
+CellSpan takeownedcell(uint_fast32_t cell) {
+    CellSpan span;
+    uint_fast32_t value = contents[cell];
+
+    if (value < FREEMIN) {
+        span.head = cell;
+        span.tail = cell;
+    } else {
+        span.head = next[value];
+        span.tail = value;
+        putfree(cell);
+    }
+    return span;
+}
+
+void discardownedcell(uint_fast32_t cell) {
+    if (contents[cell] >= FREEMIN) freeall(contents[cell]);
+    putfree(cell);
+}
+
+CellSpan makecanonicalSKKtop(uint_fast32_t skcell) {
+    uint_fast32_t ktail = contents[skcell];
+    CellSpan span = {next[ktail], skcell};
+
+    contents[skcell] = 'K';
+    next[ktail] = skcell;
+    return span;
+}
+
+void makecanonicalSKKargument(uint_fast32_t skcell,
+                              uint_fast32_t thirdcell) {
+    uint_fast32_t ktail = contents[skcell];
+    uint_fast32_t skhead = next[ktail];
+
+    contents[thirdcell] = 'K';
+    next[ktail] = thirdcell;
+    next[thirdcell] = skhead;
+    contents[skcell] = thirdcell;
+}
+
+void finishSspan(CellSpan span, uint_fast32_t rest,
+                 uint_fast32_t *resulthead, uint_fast32_t *resulttail) {
+    *resulthead = span.head;
+    next[span.tail] = rest;
+    if (rest == 0) *resulttail = span.tail;
+}
+
+int tryoptimizedS(uint_fast32_t scell,
+                  uint_fast32_t xcell, uint_fast32_t x,
+                  uint_fast32_t ycell, uint_fast32_t y,
+                  uint_fast32_t zcell, uint_fast32_t rest,
+                  uint_fast32_t *resulthead, uint_fast32_t *resulttail,
+                  uint_fast32_t *additionalsteps) {
+    // Every successful path below transfers or discards existing ownership.
+    // None allocates, clones, or consults a memo table.
+    if (x == 'K') {
+        CellSpan result = takeownedcell(zcell);
+
+        putfree(scell);
+        putfree(xcell);
+        discardownedcell(ycell);
+        finishSspan(result, rest, resulthead, resulttail);
+        *additionalsteps = 1; // K z (y z) -> z
+        return 1;
+    }
+
+    SArgumentPattern xpattern = classifySargument(x);
+    SArgumentPattern ypattern = classifySargument(y);
+
+    // S (SK) y z -> y z.
+    if (xpattern.exactsk) {
+        if (ypattern.exactsk) {
+            CellSpan result = makecanonicalSKKtop(xcell);
+
+            putfree(scell);
+            discardownedcell(ycell);
+            discardownedcell(zcell);
+            finishSspan(result, rest, resulthead, resulttail);
+            *additionalsteps = 2; // SK z (y z) -> y z
+            return 1;
+        }
+        if (ypattern.kapplication) {
+            CellSpan result = takeownedcell(ypattern.argumentcell);
+
+            putfree(scell);
+            discardownedcell(xcell);
+            discardownedcell(zcell);
+            putfree(ypattern.firstcell);
+            putfree(ycell);
+            finishSspan(result, rest, resulthead, resulttail);
+            *additionalsteps = 3; // SK eliminates x; K eliminates y
+            return 1;
+        }
+
+        CellSpan result = takeownedcell(ycell);
+
+        putfree(scell);
+        discardownedcell(xcell);
+        next[result.tail] = zcell;
+        result.tail = zcell;
+        finishSspan(result, rest, resulthead, resulttail);
+        *additionalsteps = 2; // SK z (y z) -> y z
+        return 1;
+    }
+
+    // S (K a) y z -> a (y z).
+    if (xpattern.kapplication) {
+        if (ypattern.exactsk) {
+            CellSpan result = takeownedcell(xpattern.argumentcell);
+
+            putfree(xpattern.firstcell);
+            putfree(xcell);
+            discardownedcell(zcell);
+            makecanonicalSKKargument(ycell, scell);
+            next[result.tail] = ycell;
+            result.tail = ycell;
+            finishSspan(result, rest, resulthead, resulttail);
+            *additionalsteps = 1; // K<any> z -> <any>
+            return 1;
+        }
+        if (ypattern.kapplication) {
+            CellSpan result = takeownedcell(xpattern.argumentcell);
+
+            putfree(scell);
+            putfree(xpattern.firstcell);
+            putfree(xcell);
+            putfree(ypattern.firstcell);
+            putfree(ycell);
+            discardownedcell(zcell);
+            next[result.tail] = ypattern.argumentcell;
+            result.tail = ypattern.argumentcell;
+            finishSspan(result, rest, resulthead, resulttail);
+            *additionalsteps = 2; // both K applications discard z
+            return 1;
+        }
+
+        CellSpan result = takeownedcell(xpattern.argumentcell);
+        CellSpan yz = takeownedcell(ycell);
+
+        putfree(scell);
+        putfree(xpattern.firstcell);
+        next[yz.tail] = zcell;
+        next[zcell] = yz.head;
+        contents[xcell] = zcell;
+        next[result.tail] = xcell;
+        result.tail = xcell;
+        finishSspan(result, rest, resulthead, resulttail);
+        *additionalsteps = 1; // K<any> z -> <any>
+        return 1;
+    }
+
+    // S x (SK) z -> x z (SKK).
+    if (ypattern.exactsk) {
+        CellSpan result = takeownedcell(xcell);
+
+        makecanonicalSKKargument(ycell, scell);
+        next[result.tail] = zcell;
+        next[zcell] = ycell;
+        result.tail = ycell;
+        finishSspan(result, rest, resulthead, resulttail);
+        *additionalsteps = 0;
+        return 1;
+    }
+    // S x (K a) z -> x z a.
+    if (ypattern.kapplication) {
+        CellSpan result = takeownedcell(xcell);
+
+        putfree(scell);
+        putfree(ypattern.firstcell);
+        putfree(ycell);
+        next[result.tail] = zcell;
+        next[zcell] = ypattern.argumentcell;
+        result.tail = ypattern.argumentcell;
+        finishSspan(result, rest, resulthead, resulttail);
+        *additionalsteps = 1; // K<any> z -> <any>
+        return 1;
+    }
+    return 0;
+}
+
 #define RESTOREHEAD \
 if (gotx) { \
     next[tail] = head; \
@@ -1074,7 +1288,6 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
         curchar = curconts;
         if (curchar == 'S') {
             int gotSK = 0;
-            int gotK = 0;
             uint_fast32_t needtofreex = 0;
             uint_fast32_t savey;
             
@@ -1125,6 +1338,13 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             z = contents[cells];
             rest = next[cells];
             // got x, y, and z, do S
+            uint_fast32_t optimizedsteps;
+
+            if (tryoptimizedS(head, xhead, x, yhead, y, zhead, rest, &head,
+                              &tail, &optimizedsteps)) {
+                steps += optimizedsteps;
+                goto sreduced;
+            }
             if (x >= FREEMIN) {
                 needtofreex = xhead;
                 xhead = next[x];
@@ -1173,20 +1393,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                     return;
                 }
                 curchar = curconts;
-                if (curchar == 'K') {
-                    cury = next[cury];
-#if PARANOID
-                    if (cury == 0) {
-                        RESTOREHEAD
-                        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", y);
-                        INT3
-                        return;
-                    }
-#endif
-                    if (cury == ytail) {
-                        gotK = 1;
-                    }
-                } else if (curchar == 'S') {
+                if (curchar == 'S') {
                     cury = next[cury];
 #if PARANOID
                     if (cury == 0) {
@@ -1279,54 +1486,6 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                     freeall(y);
                 }
                 steps += 2;
-            } else if (gotK) {
-                // y == (KK) or (KS) or (Kx) or (K([something]))
-                // (y z) == K or S or x or ([something])
-                // remove the (K on the left of y and the ) on the right of y
-                uint_fast32_t yK = yhead;
-                
-#if PARANOID
-                if (yK == 0) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", y);
-                    INT3
-                    return;
-                }
-                if (contents[yK] != 'K') {
-                    RESTOREHEAD
-                    printf("*** Programmer error: gotK but K is missing at %" PRIuFAST32 "\n", y);
-                    INT3
-                    return;
-                }
-#endif
-                
-                uint_fast32_t temp = next[yK];
-                
-#if PARANOID
-                if (temp == 0) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", y);
-                    INT3
-                    return;
-                }
-#endif
-                curconts = contents[temp];
-                if (curconts < FREEMIN) {
-                    // K or S or x
-                    freeall(y);
-                } else {
-                    // ([something])
-                    putfree(yK);
-                    putfree(temp);
-                }
-                // reuse savey
-                contents[savey] = curconts;
-                next[ztail] = savey;
-                next[savey] = rest;
-                if (rest == 0) {
-                    tail = savey;
-                }
-                steps += 1;
             } else {
                 // normal (y z)
 #if 0
@@ -1412,6 +1571,8 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             if (needtofreex) {
                 putfree(needtofreex);
             }
+sreduced:
+            ;
         } else if (curchar == 'K') {
             uint_fast32_t needtofreex = 0;
             

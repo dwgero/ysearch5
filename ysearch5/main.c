@@ -45,9 +45,9 @@
     #define PERTHREAD __declspec(thread)
 #endif
 
-//#define MAXLEN 11
-#define MAXLEN 10
-#define MAXBUF ((3 * MAXLEN) + 2)
+//#define MAXLEN 12
+#define MAXLEN 11
+#define MAXBUF ((3 * MAXLEN) - 1)
 #define MAXSTR maxstr
 #define MAXSTEPS maxsteps
 #define MAXARRAY 33554432
@@ -184,6 +184,11 @@ uint_fast32_t maxsteptable[12] = {
     2048, 4096, 8192, 32768, 1572864
 };
 
+_Static_assert(MAXLEN <= (sizeof(maxstrtable) / sizeof(maxstrtable[0])),
+               "MAXLEN exceeds maxstrtable capacity");
+_Static_assert(MAXLEN <= (sizeof(maxsteptable) / sizeof(maxsteptable[0])),
+               "MAXLEN exceeds maxsteptable capacity");
+
 uint_fast32_t maxstr = 1024;
 uint_fast32_t maxsteps = 1024;
 
@@ -243,6 +248,22 @@ _Atomic(uint_fast32_t) checked = 0;
 atomic_int initdone = 0;
 
 #if !SINGLE_THREAD
+#ifndef WORK_BATCH_CAPACITY
+#define WORK_BATCH_CAPACITY 32U
+#endif
+_Static_assert(WORK_BATCH_CAPACITY > 0U,
+               "worker batch capacity must be positive");
+
+typedef struct {
+    unsigned length;
+    uint_fast32_t num;
+    unsigned size;
+    char buffer[MAXBUF + 1];
+    int index[MAXLEN];
+    unsigned counts[WORK_BATCH_CAPACITY];
+    ExpressionKey expressionkeys[WORK_BATCH_CAPACITY];
+} WorkBatch;
+
 pthread_t thread[MAXTHREADS];
 sem_t *threadsem[MAXTHREADS];
 sem_t *mastersem;
@@ -250,11 +271,7 @@ _Atomic(uint64_t) threadempty = ALL_THREADS_MASK;
 _Atomic(uint64_t) threadwaiting = 0;
 atomic_int exiting = 0;
 atomic_int masterwaiting = 0;
-char workbuf[MAXTHREADS][MAXBUF + 1];
-unsigned worklen[MAXTHREADS];
-uint_fast32_t worknum[MAXTHREADS];
-unsigned workcount[MAXTHREADS];
-ExpressionKey workexpressionkey[MAXTHREADS];
+WorkBatch workbatch[MAXTHREADS];
 char threadname[MAXTHREADS][32];
 #endif
 
@@ -501,6 +518,35 @@ int_fast32_t num2str(uint_fast32_t num, int_fast32_t position, char *buffer, uin
         strncat(buffer, "?", MAXBUF);
     }
     return position;
+}
+
+void prepareSKbuffer(unsigned length, uint_fast32_t num, char *buffer,
+                     int *index) {
+    int indexnum = (int)length;
+
+    buffer[0] = '\0';
+    (void)num2str(num, (int_fast32_t)(2 * length), buffer, 1);
+    for (int position = 0; buffer[position] != '\0'; ++position) {
+        if (buffer[position] == '?') {
+            index[indexnum--] = position;
+        }
+    }
+#if PARANOID
+    if ((indexnum != -1) || (index[length] != 0)) {
+        fprintf(stderr, "*** Programmer error: malformed numeric work buffer\n");
+        INT3
+        exit(EXIT_FAILURE);
+    }
+#endif
+    buffer[0] = 'S';
+    strncat(buffer, "x", MAXBUF);
+}
+
+void setSKbuffer(unsigned length, unsigned count, char *buffer,
+                 const int *index) {
+    for (unsigned i = 0; i < length; ++i) {
+        buffer[index[i]] = (count & (1U << i)) ? 'K' : 'S';
+    }
 }
 
 uint_fast32_t str2cell(int nested, char *buffer, uint_fast32_t *str2cellspos) {
@@ -1160,7 +1206,7 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
 _Static_assert((NEVERENDS_CAPACITY != 0U) &&
                ((NEVERENDS_CAPACITY & (NEVERENDS_CAPACITY - 1U)) == 0),
                "never-ending set capacity must be a power of two");
-_Static_assert(((4U * (MAXLEN + 1U)) - 2U) <=
+_Static_assert(((4U * MAXLEN) - 2U) <=
                EXPRESSION_KEY_PAYLOAD_BITS,
                "MAXLEN expressions must fit in packed canonical keys");
 
@@ -2410,8 +2456,8 @@ ExpressionKey numericnodekey(const NumericNode *nodes, int root,
 
 int numericnodekeyandcheck(const NumericNode *nodes, int root, unsigned count,
                            ExpressionKey *expressionkey) {
-    int arguments[MAXLEN + 1];
-    ExpressionKey prefixkeys[MAXLEN + 1];
+    int arguments[MAXLEN];
+    ExpressionKey prefixkeys[MAXLEN];
     unsigned argumentcount = 0;
     unsigned prefixcount = 0;
     int current = root;
@@ -2453,7 +2499,7 @@ int numericnodekeyandcheck(const NumericNode *nodes, int root, unsigned count,
 
 int numericnodehasKorSK(const NumericNode *nodes, int root,
                         unsigned count, unsigned extraargs) {
-    int arguments[MAXLEN + 1];
+    int arguments[MAXLEN];
     unsigned argumentcount = 0;
     int current = root;
 
@@ -2599,13 +2645,99 @@ void dooneSK(unsigned length, uint_fast32_t num, unsigned count,
     evalcells(length, bufferhead, evalhead, initlen, expressionkey, buffer, 0);
 }
 
+#if !SINGLE_THREAD
+void dispatchworkbatch(const WorkBatch *batch) {
+    uint64_t thmt = atomic_load(&threadempty);
+
+#if PARANOID
+    if ((batch->size == 0) || (batch->size > WORK_BATCH_CAPACITY)) {
+        fprintf(stderr, "*** Programmer error: invalid worker batch size %u\n",
+                batch->size);
+        INT3
+        exit(EXIT_FAILURE);
+    }
+#endif
+
+    // A clear threadempty bit transfers the batch slot to the worker. The
+    // worker copies its compact descriptors before setting the bit again, so
+    // each worker can have one private active batch and one queued batch.
+    while (thmt == 0) {
+        atomic_store(&masterwaiting, 1);
+        // A worker can become free just before masterwaiting is set. Recheck
+        // after publishing the wait state so that worker either sees it and
+        // posts, or its free bit is observed here.
+        thmt = atomic_load(&threadempty);
+        if (thmt == 0) {
+            // macOS doesn't reliably restart sem_wait after a signal.
+            for (;;) {
+                int sw = sem_wait(mastersem);
+
+                if (sw == 0) break;
+                if (errno != EINTR) {
+                    fprintf(stderr, "sem_wait on mastersem failed: ");
+                    perror(NULL);
+                    INT3
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }
+        atomic_store(&masterwaiting, 0);
+        // Several workers may have posted while the producer was asleep.
+        while ((sem_trywait(mastersem) == 0) || (errno == EINTR)) {
+            // Drain surplus wakeups.
+        }
+        thmt = atomic_load(&threadempty);
+    }
+
+    unsigned threadnum = ctz64(thmt);
+
+#if PARANOID
+    if (threadnum >= MAXTHREADS) {
+        fprintf(stderr, "*** Programmer error: threadnum == %u >= MAXTHREADS == %d\n",
+                threadnum, MAXTHREADS);
+        INT3
+        exit(EXIT_FAILURE);
+    }
+#endif
+
+    uint64_t mask = (uint64_t)1 << threadnum;
+    WorkBatch *destination = &workbatch[threadnum];
+
+    destination->length = batch->length;
+    destination->num = batch->num;
+    destination->size = batch->size;
+    strcpy(destination->buffer, batch->buffer);
+    memcpy(destination->index, batch->index,
+           batch->length * sizeof(*batch->index));
+    memcpy(destination->counts, batch->counts,
+           batch->size * sizeof(*batch->counts));
+    memcpy(destination->expressionkeys, batch->expressionkeys,
+           batch->size * sizeof(*batch->expressionkeys));
+    (void)atomic_fetch_and(&threadempty, ~mask);
+
+    /*
+     * If the producer cleared the waiting bit, it owns the wakeup and must
+     * post. Otherwise the worker observed the published batch directly.
+     */
+    if (atomic_fetch_and(&threadwaiting, ~mask) & mask) {
+        if (sem_post(threadsem[threadnum]) != 0) {
+            fprintf(stderr, "sem_post on threadsem[%02u] failed: ", threadnum);
+            perror(NULL);
+            INT3
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+#endif
+
 void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
-    int index[MAXLEN + 1];
-    int indexnum = (int)length;
-    int maxcount = 1 << length;
-    int count;
-    NumericNode numericnodes[(2 * MAXLEN) + 1];
+    int index[MAXLEN];
+    unsigned maxcount = 1U << length;
+    NumericNode numericnodes[(2 * MAXLEN) - 1];
     int numericroot = decodenumerictree(length, num, numericnodes);
+#if !SINGLE_THREAD
+    WorkBatch batch = {.length = length, .num = num, .size = 0};
+#endif
 
 #if PARANOID
     if (numericroot < 0) {
@@ -2613,25 +2745,21 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
     }
 #endif
 
-    for (int posit = 0; buffer[posit] != '\0'; ++posit) {
-        if (buffer[posit] == '?') {
-            index[indexnum--] = posit;
-        }
-    }
-    buffer[0] = 'S';
-    strncat(buffer, "x", MAXBUF);
-    for (count = 0; count < maxcount; ++count) {
+    prepareSKbuffer(length, num, buffer, index);
+#if !SINGLE_THREAD
+    strcpy(batch.buffer, buffer);
+    memcpy(batch.index, index, length * sizeof(*index));
+#endif
+    for (unsigned count = 0; count < maxcount; ++count) {
         ExpressionKey expressionkey;
 
-        for (unsigned i = 0; i < length; ++i) {
-            buffer[index[i]] = (count & (1 << i)) ? 'K' : 'S';
-        }
+        setSKbuffer(length, count, buffer, index);
         if (numericnodekeyandcheck(numericnodes, numericroot,
-                                   (unsigned)count, &expressionkey)) {
+                                   count, &expressionkey)) {
             continue;
         }
         if (numericnodehasKorSK(numericnodes, numericroot,
-                               (unsigned)count, 1)) {
+                               count, 1)) {
             continue;
         }
         if (((atomic_fetch_add(&checked, 1) + 1) % 1000) == 0) {
@@ -2642,81 +2770,20 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
             pthread_mutex_unlock(&printlock);
         }
 #if SINGLE_THREAD
-        dooneSK(length, num, (unsigned)count, expressionkey, buffer);
+        dooneSK(length, num, count, expressionkey, buffer);
 #else
-        uint64_t thmt = atomic_load(&threadempty);
-        unsigned threadnum;
-        uint64_t mask;
-        
-        // there is a critical race at this point
-        // a thread running here could now turn on a bit in threadwaiting
-        // then check that masterwaiting == 0
-        // and do a sem_wait(threadsem) without doing a sem_push(mastersem)
-        while (thmt == 0) {
-            atomic_store(&masterwaiting, 1);
-            // to fix the critical race, check threadwaiting again
-            // after setting masterwaiting to 1
-            thmt = atomic_load(&threadempty);
-            if (thmt == 0) {
-                // mac os doesn't handle sigaction(SA_RESTART) correctly for sem_wait
-                // so, if errno == EINTR, try again
-                for (;;) {
-                    int sw = sem_wait(mastersem);
-                    
-                    if (sw == 0) {
-                        break;
-                    }
-                    if (errno != EINTR) {
-                        fprintf(stderr, "sem_wait on mastersem failed: ");
-                        perror(NULL);
-                        INT3
-                        exit(EXIT_FAILURE);
-                    }
-                }
-            }
-            atomic_store(&masterwaiting, 0);
-            // there could have been many sem_post(mastersem)
-            // while masterwaiting was 1
-            // ignore all the rest
-            while ((sem_trywait(mastersem) == 0) || (errno == EINTR)) {
-                // nothing to do, keep going
-            }
-            thmt = atomic_load(&threadempty);
-        }
-        
-        threadnum = ctz64(thmt);
-        
-#if PARANOID
-        if (threadnum >= MAXTHREADS) {
-            fprintf(stderr, "*** Programmer error: threadnum == %u >= MAXTHREADS == %d\n",
-                    threadnum, MAXTHREADS);
-            INT3
-            exit(EXIT_FAILURE);
-        }
-#endif
-        
-        mask = (uint64_t)1 << threadnum;
-        strcpy(workbuf[threadnum], buffer);
-        worklen[threadnum] = length;
-        worknum[threadnum] = num;
-        workcount[threadnum] = (unsigned)count;
-        workexpressionkey[threadnum] = expressionkey;
-        (void)atomic_fetch_and(&threadempty, ~mask);
-        
-        /*
-         * If the producer cleared the waiting bit, it owns the wakeup
-         * and must post.
-         */
-        if (atomic_fetch_and(&threadwaiting, ~mask) & mask) {
-            if (sem_post(threadsem[threadnum]) != 0) {
-                fprintf(stderr, "sem_post on threadsem[%02u] failed: ", threadnum);
-                perror(NULL);
-                INT3
-                exit(EXIT_FAILURE);
-            }
+        batch.counts[batch.size] = count;
+        batch.expressionkeys[batch.size] = expressionkey;
+        batch.size++;
+        if (batch.size == WORK_BATCH_CAPACITY) {
+            dispatchworkbatch(&batch);
+            batch.size = 0;
         }
 #endif
     }
+#if !SINGLE_THREAD
+    if (batch.size != 0) dispatchworkbatch(&batch);
+#endif
 }
 
 #if !SINGLE_THREAD
@@ -2732,13 +2799,34 @@ void *threadrun(void *arg) {
             break;
         }
         if ((atomic_load(&threadempty) & mask) == 0) {
-            unsigned mylen = worklen[mythreadnum];
-            uint_fast32_t mynum = worknum[mythreadnum];
-            unsigned mycount = workcount[mythreadnum];
-            ExpressionKey myexpressionkey = workexpressionkey[mythreadnum];
-            char mybuf[MAXBUF+1];
-            
-            strcpy(mybuf, workbuf[mythreadnum]);
+            WorkBatch *mybatch = &workbatch[mythreadnum];
+            unsigned mylen = mybatch->length;
+            uint_fast32_t mynum = mybatch->num;
+            unsigned mysize = mybatch->size;
+            unsigned mycounts[WORK_BATCH_CAPACITY];
+            ExpressionKey myexpressionkeys[WORK_BATCH_CAPACITY];
+            char mybuf[MAXBUF + 1];
+            int myindex[MAXLEN];
+
+#if PARANOID
+            if ((mysize == 0) || (mysize > WORK_BATCH_CAPACITY)) {
+                fprintf(stderr, "*** Programmer error: invalid worker batch size %u\n",
+                        mysize);
+                INT3
+                exit(EXIT_FAILURE);
+            }
+#endif
+            strcpy(mybuf, mybatch->buffer);
+            memcpy(myindex, mybatch->index,
+                   mylen * sizeof(*myindex));
+            memcpy(mycounts, mybatch->counts,
+                   mysize * sizeof(*mycounts));
+            memcpy(myexpressionkeys, mybatch->expressionkeys,
+                   mysize * sizeof(*myexpressionkeys));
+
+            // Everything needed by this worker is now private. Releasing the
+            // slot here preserves the old one-slot lookahead while amortizing
+            // that handoff over the entire batch.
             (void)atomic_fetch_or(&threadempty, mask);
             if (atomic_load(&masterwaiting)) {
                 if (sem_post(mastersem) != 0) {
@@ -2748,7 +2836,14 @@ void *threadrun(void *arg) {
                     exit(EXIT_FAILURE);
                 }
             }
-            dooneSK(mylen, mynum, mycount, myexpressionkey, mybuf);
+
+            for (unsigned i = 0; i < mysize; ++i) {
+                unsigned mycount = mycounts[i];
+                ExpressionKey myexpressionkey = myexpressionkeys[i];
+
+                setSKbuffer(mylen, mycount, mybuf, myindex);
+                dooneSK(mylen, mynum, mycount, myexpressionkey, mybuf);
+            }
             continue;
         }
         (void)atomic_fetch_or(&threadwaiting, mask);
@@ -3046,7 +3141,7 @@ int main(void) {
 #endif // DOTESTS
     
 #if DOSEARCH
-    for (unsigned length = 0; length <= MAXLEN; ++length) {
+    for (unsigned length = 0; length < MAXLEN; ++length) {
         unsigned lastnum = endnum(length);
         
         printf("\nLength %u:\n", (length + 1));
@@ -3076,9 +3171,6 @@ int main(void) {
             num2fps(nextnum, (2 * length));
             puts(buffer);
 #endif
-            buffer[0] = '\0';
-            num2str(nextnum, (int_fast32_t)(2 * length), buffer, 1);
-            //puts(buffer);
             generateallSK(length, nextnum, buffer);
         }
 #if !SINGLE_THREAD

@@ -219,7 +219,9 @@ pthread_mutex_t printlock = PTHREAD_MUTEX_INITIALIZER;
 
 uint_fast32_t *nxt[MAXTHREADS];
 uint_fast32_t *cnts[MAXTHREADS];
-// if contents < FREEMIN, it's a character
+// An expression pointer identifies its tail cell; next[tail] identifies its
+// head cell, making the expression a circular ring. If contents < FREEMIN,
+// it is a character; otherwise it identifies the tail of a subexpression.
 #define FREEMIN 256
 uint_fast32_t hwm[MAXTHREADS];
 uint_fast32_t frls[MAXTHREADS];
@@ -284,21 +286,16 @@ void putfree(uint_fast32_t cell) {
 }
 
 void freeall(uint_fast32_t cells) {
-    uint_fast32_t tail;
+    uint_fast32_t tail = cells;
+    uint_fast32_t head;
     
     if (cells < FREEMIN) {
         printf("*** Programmer error: freeall called for non-list %" PRIuFAST32 "\n", cells);
         INT3
         return;
     }
-    tail = contents[cells];
-    {
-        uint_fast32_t temp;
-        
-        temp = next[cells];
-        putfree(cells);
-        cells = temp; // = next[cells]
-    }
+    head = next[tail];
+    cells = head;
 #if PARANOID
     if (cells == 0) {
         printf("*** Programmer error: unexpected end of cells during freeall\n");
@@ -306,25 +303,17 @@ void freeall(uint_fast32_t cells) {
         return;
     }
 #endif
-    if (contents[cells] >= FREEMIN) {
-        freeall(contents[cells]);
-        printf("*** Programmer error: first item of cells is subcells during freeall\n");
-        INT3
-    }
-    if (cells == tail) {
-        putfree(cells);
-        printf("*** Programmer error: only one item in cells during freeall\n");
-        INT3
-        return;
-    }
     for (;;) {
-        {
-            uint_fast32_t temp;
-            
-            temp = next[cells];
-            putfree(cells);
-            cells = temp; // = next[cells]
+        uint_fast32_t temp = next[cells];
+
+        if (contents[cells] >= FREEMIN) {
+            freeall(contents[cells]);
         }
+        putfree(cells);
+        if (cells == tail) {
+            return;
+        }
+        cells = temp;
 #if PARANOID
         if (cells == 0) {
             printf("*** Programmer error: unexpected end of cells during freeall\n");
@@ -332,13 +321,6 @@ void freeall(uint_fast32_t cells) {
             return;
         }
 #endif
-        if (contents[cells] >= FREEMIN) {
-            freeall(contents[cells]);
-        }
-        if (cells == tail) {
-            putfree(cells);
-            return;
-        }
     }
 }
 
@@ -454,14 +436,8 @@ uint_fast32_t str2cell(int nested, char *buffer, uint_fast32_t *str2cellspos) {
                 return 0;
             }
 #endif
-            temp = getfree();
-            if (temp == 0) {
-                return 0;
-            }
-            //next[tail] = 0;
-            contents[temp] = tail;
-            next[temp] = head;
-            return temp;
+            next[tail] = head;
+            return tail;
         }
         if (curchar == ')') {
 #if PARANOID
@@ -471,14 +447,8 @@ uint_fast32_t str2cell(int nested, char *buffer, uint_fast32_t *str2cellspos) {
                 return 0;
             }
 #endif
-            temp = getfree();
-            if (temp == 0) {
-                return 0;
-            }
-            //next[tail] = 0;
-            contents[temp] = tail;
-            next[temp] = head;
-            return temp;
+            next[tail] = head;
+            return tail;
         }
         if (curchar == '(') {
 #if PARANOID
@@ -497,7 +467,7 @@ uint_fast32_t str2cell(int nested, char *buffer, uint_fast32_t *str2cellspos) {
                 return 0;
             }
             contents[temp] = temp2;
-            next[temp] = 0;
+            next[temp] = head;
 #if PARANOID
             if (head == 0) {
                 head = temp;
@@ -534,22 +504,13 @@ uint_fast32_t str2cells(char *buffer) {
 }
 
 void printcells(uint_fast32_t startcell) {
-    uint_fast32_t cells = startcell;
-    uint_fast32_t tail;
+    uint_fast32_t tail = startcell;
+    uint_fast32_t cells = next[tail];
     uint_fast32_t curconts;
     
 #if PARANOID
     if (cells == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
-        INT3
-        return;
-    }
-#endif
-    tail = contents[cells];
-    cells = next[cells];
-#if PARANOID
-    if (cells == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
+        printf("*** Programmer error: unexpected end of cells during print at %" PRIuFAST32 "\n", startcell);
         INT3
         return;
     }
@@ -574,7 +535,7 @@ void printcells(uint_fast32_t startcell) {
         cells = next[cells];
 #if PARANOID
         if (cells == 0) {
-            printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
+            printf("*** Programmer error: unexpected end of cells during print at %" PRIuFAST32 "\n", startcell);
             INT3
             return;
         }
@@ -610,22 +571,13 @@ char strbuf[MAXARRAY + 1];
 int cells2strpos = 0;
 
 void cell2str(uint_fast32_t startcell) {
-    uint_fast32_t cells = startcell;
-    uint_fast32_t tail;
+    uint_fast32_t tail = startcell;
+    uint_fast32_t cells = next[tail];
     uint_fast32_t curconts;
     
 #if PARANOID
     if (cells == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
-        INT3
-        return;
-    }
-#endif
-    tail = contents[cells];
-    cells = next[cells];
-#if PARANOID
-    if (cells == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
+        printf("*** Programmer error: unexpected end of cells during conversion at %" PRIuFAST32 "\n", startcell);
         INT3
         return;
     }
@@ -650,7 +602,7 @@ void cell2str(uint_fast32_t startcell) {
         cells = next[cells];
 #if PARANOID
         if (cells == 0) {
-            printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
+            printf("*** Programmer error: unexpected end of cells during conversion at %" PRIuFAST32 "\n", startcell);
             INT3
             return;
         }
@@ -674,24 +626,15 @@ void cells2str(uint_fast32_t cells) {
 #endif
 
 uint_fast32_t clonecells(uint_fast32_t startcell) {
-    uint_fast32_t cells = startcell;
-    uint_fast32_t tail;
+    uint_fast32_t tail = startcell;
+    uint_fast32_t cells = next[tail];
     uint_fast32_t curconts;
     uint_fast32_t newhead;
     uint_fast32_t newtail;
     
 #if PARANOID
     if (cells == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
-        INT3
-        return 0;
-    }
-#endif
-    tail = contents[cells];
-    cells = next[cells];
-#if PARANOID
-    if (cells == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcell);
+        printf("*** Programmer error: unexpected end of cells during clone at %" PRIuFAST32 "\n", startcell);
         INT3
         return 0;
     }
@@ -720,15 +663,8 @@ uint_fast32_t clonecells(uint_fast32_t startcell) {
     }
     for (;;) {
         if (cells == tail) {
-            uint_fast32_t temp = getfree();
-            
-            if (temp == 0) {
-                return 0;
-            }
-            next[newtail] = 0;
-            contents[temp] = newtail;
-            next[temp] = newhead;
-            return temp;
+            next[newtail] = newhead;
+            return newtail;
         }
         cells = next[cells];
 #if PARANOID
@@ -767,35 +703,20 @@ uint_fast32_t clonecontents(uint_fast32_t conts) {
 
 // startcells1 is always bufferhead if toplevel == 1
 int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int toplevel) {
-    uint_fast32_t cells1 = startcells1;
-    uint_fast32_t cells2 = startcells2;
-    uint_fast32_t tail1, tail2;
+    uint_fast32_t tail1 = startcells1;
+    uint_fast32_t tail2 = startcells2;
+    uint_fast32_t cells1 = next[tail1];
+    uint_fast32_t cells2 = next[tail2];
     uint_fast32_t curconts1, curconts2;
     
 #if PARANOID
     if (cells1 == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcells1);
+        printf("*** Programmer error: unexpected end of first comparison at %" PRIuFAST32 "\n", startcells1);
         INT3
         return 0;
     }
     if (cells2 == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcells2);
-        INT3
-        return 0;
-    }
-#endif
-    tail1 = contents[cells1];
-    tail2 = contents[cells2];
-    cells1 = next[cells1];
-    cells2 = next[cells2];
-#if PARANOID
-    if (cells1 == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcells1);
-        INT3
-        return 0;
-    }
-    if (cells2 == 0) {
-        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcells2);
+        printf("*** Programmer error: unexpected end of second comparison at %" PRIuFAST32 "\n", startcells2);
         INT3
         return 0;
     }
@@ -837,12 +758,13 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
         cells2 = next[cells2];
 #if PARANOID
         if (cells1 == 0) {
-            printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcells1);
+            printf("*** Programmer error: unexpected end of first comparison at %" PRIuFAST32 "\n", startcells1);
             INT3
             return 0;
         }
         if (cells2 == 0) {
-            printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", startcells2);
+            printf("*** Programmer error: unexpected end of comparison %" PRIuFAST32
+                   " against %" PRIuFAST32 "\n", startcells1, startcells2);
             INT3
             return 0;
         }
@@ -1003,11 +925,12 @@ int checkforneverends(size_t bufferlen, char *buffer, uint_fast32_t position) {
 
 #define RESTOREHEAD \
 if (gotx) { \
-    next[subhead] = head; \
-    contents[subhead] = tail; \
+    next[tail] = head; \
+    contents[subowner] = tail; \
+    subhead = tail; \
 } else { \
-    next[evalhead] = head; \
-    contents[evalhead] = tail; \
+    next[tail] = head; \
+    evalhead = tail; \
 }
 
 void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead,
@@ -1021,6 +944,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
     uint_fast32_t tail;
     uint_fast32_t curconts;
     uint_fast32_t subhead = 0;
+    uint_fast32_t subowner = 0;
     
 #if 0
     putcells(evalhead);
@@ -1032,8 +956,9 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
         return;
     }
 #endif
-    head = next[cells];
-    tail = contents[cells];
+    tail = cells;
+    head = next[tail];
+    next[tail] = 0;
     //printf("evalhead:%" PRIuFAST32 " head:%" PRIuFAST32 " tail:%" PRIuFAST32 "\n", evalhead, head, tail);
 #if PARANOID
     if (head == tail) {
@@ -1124,7 +1049,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             if (x >= FREEMIN) {
                 needtofreex = xhead;
                 xhead = next[x];
-                xtail = contents[x];
+                xtail = x;
 #if PARANOID
                 if (xhead == 0) {
                     RESTOREHEAD
@@ -1145,7 +1070,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                 uint_fast32_t cury;
                 
                 yhead = next[y];
-                ytail = contents[y];
+                ytail = y;
 #if PARANOID
                 if (yhead == 0) {
                     RESTOREHEAD
@@ -1223,9 +1148,6 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             printf("x:");
             putcontents(x);
 #endif
-            if (x >= FREEMIN) {
-                putfree(x); // not freeall(x)
-            }
             // copy z
             next[xtail] = zhead;
             //printf("xhead:%" PRIuFAST32 " xtail:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
@@ -1315,7 +1237,6 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                     freeall(y);
                 } else {
                     // ([something])
-                    putfree(y);
                     putfree(yK);
                     putfree(temp);
                 }
@@ -1329,22 +1250,10 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                 steps += 1;
             } else {
                 // normal (y z)
-                uint_fast32_t newcells = getfree();
-                
-                if (newcells == 0) {
-                    steps = MAXSTEPS;
-                    break;
-                }
-                // copy y without outermost parens
-                next[newcells] = yhead;
 #if 0
                 printf("y:");
                 putcontents(y);
 #endif
-                if (y >= FREEMIN) {
-                    putfree(y); // not freeall(y)
-                }
-                
                 // copy clone of z
                 uint_fast32_t temp = clonecontents(z);
                 
@@ -1372,14 +1281,12 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                     }
                 }
                 contents[savey] = temp;
-                next[savey] = 0;
-                //printf("savey:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:0\n", savey, temp);
+                next[savey] = yhead;
+                //printf("savey:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
+                //       savey, temp, yhead);
                 next[ytail] = savey;
                 //printf("yhead:%" PRIuFAST32 " ytail:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
                 //       yhead, ytail, contents[ytail], savey);
-                contents[newcells] = savey;
-                //printf("newcells:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
-                //       newcells, savey, next[newcells]);
                 temp = getfree();
                 if (temp == 0) {
                     steps = MAXSTEPS;
@@ -1388,9 +1295,10 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                 next[ztail] = temp;
                 //printf("ztail:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
                 //       ztail, contents[ztail], temp);
-                contents[temp] = newcells;
+                contents[temp] = savey;
                 next[temp] = rest;
-                //printf("temp:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n", temp, newcells, rest);
+                //printf("temp:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
+                //       temp, savey, rest);
                 if (rest == 0) {
                     tail = temp;
                 }
@@ -1463,7 +1371,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             if (x >= FREEMIN) {
                 needtofreex = xhead;
                 xhead = next[x];
-                xtail = contents[x];
+                xtail = x;
 #if PARANOID
                 if (xhead == 0) {
                     RESTOREHEAD
@@ -1487,9 +1395,6 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             printf("x:");
             putcontents(x);
 #endif
-            if (x >= FREEMIN) {
-                putfree(x); // not freeall(x)
-            }
             // y isn't copied
             putfree(yhead);
             if (y >= FREEMIN) {
@@ -1526,10 +1431,11 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                 break;
             }
             // restart evaluation at curconts
-            next[evalhead] = head;
-            contents[evalhead] = tail;
+            next[tail] = head;
+            evalhead = tail;
+            subowner = cells;
             head = next[curconts];
-            tail = contents[curconts];
+            tail = curconts;
 #if PARANOID
             if (head == tail) {
                 printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", evalhead);
@@ -1540,6 +1446,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             subhead = curconts;
             gotx = 1;
             if (equalcells(bufferhead, subhead, 0) == 0) {
+                next[tail] = 0;
                 continue;
             }
         } else {
@@ -1568,6 +1475,9 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                 break;
             }
         }
+        // Evaluator mutations use a temporary linear chain. RESTOREHEAD closes
+        // the ring for comparison, so reopen it before the next reduction.
+        next[tail] = 0;
     }
 
     uint_fast32_t peakcells = peakbuflen - initlen;

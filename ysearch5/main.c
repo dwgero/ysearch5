@@ -204,22 +204,32 @@ char bufmaxlen[MAXBUF + 1];
 
 pthread_mutex_t printlock = PTHREAD_MUTEX_INITIALIZER;
 
-// rather than refactoring, just redefine
+// Allocator state changes on every cell allocation/free. Keep it private to
+// each worker so independent evaluators do not contend for one cache line.
+// The cell arrays themselves remain selected by worker id.
 #if SINGLE_THREAD
     #define next nxt[0]
     #define contents cnts[0]
-    #define highwatermark hwm[0]
-    #define freelist frls[0]
-    #define buflen bfln[0]
+    static uint_fast32_t highwatermark;
+    static uint_fast32_t freelist;
+    static uint_fast32_t buflen;
     static uint_fast32_t peakbuflen;
 #else
-    PERTHREAD static int myid;
+    typedef struct {
+        int id;
+        uint_fast32_t highwatermark_value;
+        uint_fast32_t freelist_value;
+        uint_fast32_t buflen_value;
+        uint_fast32_t peakbuflen_value;
+    } ThreadAllocatorState;
+    PERTHREAD static ThreadAllocatorState allocatorstate;
+    #define myid allocatorstate.id
     #define next nxt[myid]
     #define contents cnts[myid]
-    #define highwatermark hwm[myid]
-    #define freelist frls[myid]
-    #define buflen bfln[myid]
-    PERTHREAD static uint_fast32_t peakbuflen;
+    #define highwatermark allocatorstate.highwatermark_value
+    #define freelist allocatorstate.freelist_value
+    #define buflen allocatorstate.buflen_value
+    #define peakbuflen allocatorstate.peakbuflen_value
 #endif
 
 uint_fast32_t *nxt[MAXTHREADS];
@@ -238,9 +248,6 @@ _Static_assert((MEMO_BIT & (MEMO_BIT - 1)) == 0,
 _Static_assert((uint_fast32_t)MAXARRAY < MEMO_BIT,
                "arena indices must fit below MEMO_BIT");
 typedef uint64_t ExpressionKey;
-uint_fast32_t hwm[MAXTHREADS];
-uint_fast32_t frls[MAXTHREADS];
-uint_fast32_t bfln[MAXTHREADS];
 
 _Atomic(uint_fast32_t) repeatcount = 0;
 _Atomic(uint_fast32_t) nevercount = 0;

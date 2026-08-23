@@ -1799,42 +1799,6 @@ enum HeadExposure {
     HEAD_CHANGED = 2
 };
 
-static int exposehead(uint_fast32_t *headptr, uint_fast32_t *tailptr,
-                      uint_fast32_t *cost, uint_fast32_t *resumememo,
-                      MemoPath *path);
-
-// Advance one shared target contraction in isolation. Keeping this to one
-// evaluator turn preserves the outer evaluator's repeat/winner observations.
-static int forcememoone(uint_fast32_t memo, uint_fast32_t *cost,
-                        uint_fast32_t *resumememo, MemoPath *path) {
-    uint_fast32_t state = next[memo];
-
-    *cost = 0;
-    if ((state & MEMO_BIT) != 0) return HEAD_ERROR;
-    next[memo] = state | MEMO_BIT;
-
-    uint_fast32_t tail = contents[memo];
-    uint_fast32_t head = next[tail];
-    int result;
-
-    next[tail] = 0;
-    result = exposehead(&head, &tail, cost, resumememo, path);
-    if (result == HEAD_READY) {
-        int reduced = reducetop(&head, &tail, cost);
-
-        if (reduced < 0) {
-            result = HEAD_ERROR;
-        } else if (reduced > 0) {
-            result = HEAD_PROGRESS;
-            *resumememo = memo;
-        }
-    }
-    next[tail] = head;
-    contents[memo] = tail;
-    next[memo] &= MEMO_MASK;
-    return result;
-}
-
 static int ringisweakhead(uint_fast32_t tail) {
     uint_fast32_t head = next[tail];
     uint_fast32_t value = contents[head];
@@ -1895,60 +1859,214 @@ static int exposeweakhead(uint_fast32_t *headptr, uint_fast32_t *tailptr) {
     }
 }
 
-// Remove leading parentheses/indirections from an open chain. Direct owned
-// rings can be transferred. A last memo reference can likewise be stolen;
-// otherwise its target advances to weak-head form in isolation and is cloned
-// only after it is stable, so outer arguments never contaminate shared state.
+static int openpathmemo(MemoPath *path, uint_fast32_t *headptr,
+                        uint_fast32_t *tailptr) {
+    uint_fast32_t memo = path->frames[path->depth - 1].memo;
+    uint_fast32_t state = next[memo];
+
+    if ((state & MEMO_BIT) != 0) return 0;
+    next[memo] = state | MEMO_BIT;
+    *tailptr = contents[memo];
+    *headptr = next[*tailptr];
+    next[*tailptr] = 0;
+    return 1;
+}
+
+static void closepathmemo(MemoPath *path, uint_fast32_t head,
+                          uint_fast32_t tail) {
+    uint_fast32_t memo = path->frames[path->depth - 1].memo;
+
+    next[tail] = head;
+    contents[memo] = tail;
+    next[memo] &= MEMO_MASK;
+}
+
+// Remove leading parentheses/indirections from the base open chain. Shared
+// memo targets are advanced with an iterative update path: only the deepest
+// target is open, ancestor targets stay closed, and a weak-head child is
+// materialized into its parent frame before that frame resumes. This keeps one
+// outer observation per contraction without recursively revisiting ancestors.
 static int exposehead(uint_fast32_t *headptr, uint_fast32_t *tailptr,
-                      uint_fast32_t *cost, uint_fast32_t *resumememo,
-                      MemoPath *path) {
-    int changed = 0;
+                      uint_fast32_t *cost, MemoPath *path) {
+    uint_fast32_t basehead = *headptr;
+    uint_fast32_t basetail = *tailptr;
+    uint_fast32_t head = basehead;
+    uint_fast32_t tail = basetail;
+    int basechanged = 0;
 
     *cost = 0;
+    if ((path->depth != 0) && !openpathmemo(path, &head, &tail)) {
+        return HEAD_ERROR;
+    }
+
     for (;;) {
-        uint_fast32_t occurrence = *headptr;
+        uint_fast32_t occurrence = head;
         uint_fast32_t value = contents[occurrence];
 
-        if (value < FREEMIN) return changed ? HEAD_CHANGED : HEAD_READY;
+        if (value >= FREEMIN) {
+            uint_fast32_t rest = next[occurrence];
+            uint_fast32_t replacement;
 
-        uint_fast32_t rest = next[occurrence];
-        uint_fast32_t replacement;
-
-        if (isdirectcontents(value)) {
-            replacement = value;
-        } else {
-            uint_fast32_t memo = memocell(value);
-            uint_fast32_t state = next[memo];
-
-            if ((state & MEMO_BIT) != 0) return HEAD_ERROR;
-            if (memoreferences(memo) == 1) {
-                replacement = contents[memo];
-                putfree(memo);
+            if (isdirectcontents(value)) {
+                replacement = value;
             } else {
-                size_t olddepth = path->depth;
-                int forced;
+                uint_fast32_t memo = memocell(value);
+                uint_fast32_t state = next[memo];
 
-                if (memoinpath(path, memo)) return HEAD_ERROR;
-                pushmemopath(path, memo, occurrence, *tailptr);
-                do {
-                    forced = forcememoone(memo, cost, resumememo, path);
-                } while (forced == HEAD_CHANGED);
+                if (((state & MEMO_BIT) != 0) || memoinpath(path, memo)) {
+                    if (path->depth != 0) {
+                        closepathmemo(path, head, tail);
+                        *headptr = basehead;
+                        *tailptr = basetail;
+                    } else {
+                        *headptr = head;
+                        *tailptr = tail;
+                    }
+                    return HEAD_ERROR;
+                }
+                if (memoreferences(memo) == 1) {
+                    replacement = contents[memo];
+                    putfree(memo);
+                } else {
+                    size_t olddepth = path->depth;
 
-                if (forced != HEAD_READY) return forced;
-                truncatememopath(path, olddepth);
-                replacement = clonecells(contents[memo]);
-                if (replacement == 0) return HEAD_ERROR;
-                releasecontents(value);
+                    pushmemopath(path, memo, occurrence, tail);
+                    if (olddepth != 0) {
+                        uint_fast32_t parentmemo =
+                            path->frames[olddepth - 1].memo;
+
+                        next[tail] = head;
+                        contents[parentmemo] = tail;
+                        next[parentmemo] &= MEMO_MASK;
+                    } else {
+                        basehead = head;
+                        basetail = tail;
+                    }
+                    if (!openpathmemo(path, &head, &tail)) {
+                        *headptr = basehead;
+                        *tailptr = basetail;
+                        return HEAD_ERROR;
+                    }
+                    continue;
+                }
+            }
+
+            uint_fast32_t replacementhead = next[replacement];
+
+            next[replacement] = rest;
+            if (occurrence == tail) tail = replacement;
+            putfree(occurrence);
+            head = replacementhead;
+            if (path->depth == 0) basechanged = 1;
+            continue;
+        }
+
+        if (path->depth == 0) {
+            *headptr = head;
+            *tailptr = tail;
+            return basechanged ? HEAD_CHANGED : HEAD_READY;
+        }
+
+        int reduced = reducetop(&head, &tail, cost);
+
+        if (reduced < 0) {
+            closepathmemo(path, head, tail);
+            *headptr = basehead;
+            *tailptr = basetail;
+            return HEAD_ERROR;
+        }
+        if (reduced > 0) {
+            closepathmemo(path, head, tail);
+            *headptr = basehead;
+            *tailptr = basetail;
+            return HEAD_PROGRESS;
+        }
+
+        size_t childdepth = path->depth;
+        MemoPathFrame childframe = path->frames[childdepth - 1];
+        uint_fast32_t childmemo = childframe.memo;
+        uint_fast32_t childtag = contents[childframe.occurrence];
+        uint_fast32_t replacement;
+        int steal = 0;
+
+        closepathmemo(path, head, tail);
+        if (memoreferences(childmemo) == 1) {
+            replacement = contents[childmemo];
+            steal = 1;
+        } else {
+            replacement = clonecells(contents[childmemo]);
+            if (replacement == 0) {
+                *headptr = basehead;
+                *tailptr = basetail;
+                return HEAD_ERROR;
             }
         }
 
+        size_t parentdepth = childdepth - 1;
+
+#if PARANOID
+        if (!ismemocontents(childtag) ||
+            (memocell(childtag) != childmemo)) {
+            printf("*** Programmer error: memo update occurrence changed\n");
+            INT3
+            if (!steal) freeall(replacement);
+            *headptr = basehead;
+            *tailptr = basetail;
+            return HEAD_ERROR;
+        }
+        if ((parentdepth != 0) &&
+            ((next[path->frames[parentdepth - 1].memo] & MEMO_BIT) != 0)) {
+            printf("*** Programmer error: memo update parent is busy\n");
+            INT3
+            if (!steal) freeall(replacement);
+            *headptr = basehead;
+            *tailptr = basetail;
+            return HEAD_ERROR;
+        }
+#endif
+
+        truncatememopath(path, parentdepth);
+        if (parentdepth == 0) {
+            head = basehead;
+            tail = basetail;
+        } else if (!openpathmemo(path, &head, &tail)) {
+            if (!steal) freeall(replacement);
+            *headptr = basehead;
+            *tailptr = basetail;
+            return HEAD_ERROR;
+        }
+
+#if PARANOID
+        if ((head != childframe.occurrence) ||
+            (tail != childframe.parenttail)) {
+            printf("*** Programmer error: memo update parent changed\n");
+            INT3
+            if (parentdepth != 0) closepathmemo(path, head, tail);
+            if (!steal) freeall(replacement);
+            *headptr = basehead;
+            *tailptr = basetail;
+            return HEAD_ERROR;
+        }
+#endif
+
+        uint_fast32_t rest = next[childframe.occurrence];
         uint_fast32_t replacementhead = next[replacement];
 
+        if (steal) {
+            putfree(childmemo);
+        } else {
+            releasecontents(childtag);
+        }
         next[replacement] = rest;
-        if (occurrence == *tailptr) *tailptr = replacement;
-        putfree(occurrence);
-        *headptr = replacementhead;
-        changed = 1;
+        if (childframe.occurrence == tail) tail = replacement;
+        putfree(childframe.occurrence);
+        head = replacementhead;
+
+        if (parentdepth == 0) {
+            basehead = head;
+            basetail = tail;
+            basechanged = 1;
+        }
     }
 }
 
@@ -1976,7 +2094,6 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
     uint_fast32_t subhead = 0;
     uint_fast32_t subowner = 0;
     uint_fast32_t submemo = 0;
-    uint_fast32_t resumememo = 0;
     MemoPath *path = &evaluatorpath;
 
     clearmemopath(path);
@@ -2005,25 +2122,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
 
     while (steps < MAXSTEPS) {
         uint_fast32_t reductioncost = 0;
-        int exposed;
-
-        if (resumememo != 0) {
-            uint_fast32_t memo = resumememo;
-
-            resumememo = 0;
-            do {
-                exposed = forcememoone(memo, &reductioncost, &resumememo,
-                                       path);
-            } while (exposed == HEAD_CHANGED);
-            if (exposed == HEAD_READY) {
-                clearmemopath(path);
-                exposed = exposehead(&head, &tail, &reductioncost,
-                                     &resumememo, path);
-            }
-        } else {
-            exposed = exposehead(&head, &tail, &reductioncost, &resumememo,
-                                 path);
-        }
+        int exposed = exposehead(&head, &tail, &reductioncost, path);
 
         if (exposed == HEAD_ERROR) {
             steps = MAXSTEPS;
@@ -2123,7 +2222,6 @@ reductionobserved:
             if (weakheadexposed == HEAD_ERROR) {
                 steps = MAXSTEPS;
             } else if (weakheadexposed == HEAD_CHANGED) {
-                resumememo = 0;
                 clearmemopath(path);
             }
         }

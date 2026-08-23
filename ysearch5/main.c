@@ -1135,11 +1135,20 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
     }
 }
 
-#define INITIAL_CAPACITY 100000 // 50% load factor for 50k items
-#define INITIAL_INTERN_CAPACITY 131072
+// Open-addressed tables use capacity masks instead of division.
+#define INITIAL_CAPACITY 131072U
+#define INITIAL_INTERN_CAPACITY 131072U
 #define ID_S 1U
 #define ID_K 2U
 #define ID_X 3U
+
+_Static_assert((INITIAL_CAPACITY != 0U) &&
+               ((INITIAL_CAPACITY & (INITIAL_CAPACITY - 1U)) == 0),
+               "initial set capacity must be a power of two");
+_Static_assert((INITIAL_INTERN_CAPACITY != 0U) &&
+               ((INITIAL_INTERN_CAPACITY &
+                 (INITIAL_INTERN_CAPACITY - 1U)) == 0),
+               "initial interner capacity must be a power of two");
 
 typedef struct {
     uint32_t *keys;
@@ -1155,16 +1164,21 @@ typedef struct {
     uint32_t nextid;
 } ApplicationInterner;
 
-uint32_t hash64(uint64_t value, uint32_t capacity) {
+static inline int validhashcapacity(uint32_t capacity) {
+    return (capacity != 0) && ((capacity & (capacity - 1)) == 0);
+}
+
+static inline uint32_t hash64(uint64_t value, uint32_t mask) {
     value ^= value >> 33;
     value *= UINT64_C(0xff51afd7ed558ccd);
     value ^= value >> 33;
     value *= UINT64_C(0xc4ceb9fe1a85ec53);
     value ^= value >> 33;
-    return (uint32_t)(value % capacity);
+    return (uint32_t)value & mask;
 }
 
 IdSet *set_create(uint32_t capacity) {
+    if (!validhashcapacity(capacity)) return NULL;
     IdSet *set = malloc(sizeof(IdSet));
     if (!set) return NULL;
     set->keys = calloc(capacity, sizeof(*set->keys));
@@ -1177,17 +1191,18 @@ IdSet *set_create(uint32_t capacity) {
 IdSet *neverends;
 
 int set_add(IdSet *set, uint32_t key) {
-    if (set->size >= set->capacity / 2) {
+    if (set->size >= (set->capacity / 2U)) {
         fprintf(stderr,
                 "never-ending expression set reached its maximum size of %" PRIu32 " entries\n",
-                set->capacity / 2);
+                set->capacity / 2U);
         exit(EXIT_FAILURE);
     }
 
-    uint32_t index = hash64(key, set->capacity);
+    uint32_t mask = set->capacity - 1U;
+    uint32_t index = hash64(key, mask);
     while (set->keys[index] != 0) {
         if (set->keys[index] == key) return 1; // Already exists
-        index = (index + 1) % set->capacity;
+        index = (index + 1U) & mask;
     }
 
     set->keys[index] = key;
@@ -1196,12 +1211,13 @@ int set_add(IdSet *set, uint32_t key) {
 }
 
 int set_contains(IdSet *set, uint32_t key) {
-    uint32_t index = hash64(key, set->capacity);
+    uint32_t mask = set->capacity - 1U;
+    uint32_t index = hash64(key, mask);
     uint32_t start = index;
 
     while (set->keys[index] != 0) {
         if (set->keys[index] == key) return 1;
-        index = (index + 1) % set->capacity;
+        index = (index + 1U) & mask;
         if (index == start) break;
     }
     return 0;
@@ -1213,6 +1229,7 @@ void set_destroy(IdSet *set) {
 }
 
 ApplicationInterner *interner_create(uint32_t capacity) {
+    if (!validhashcapacity(capacity)) return NULL;
     ApplicationInterner *interner = malloc(sizeof(*interner));
     if (interner == NULL) return NULL;
     interner->keys = calloc(capacity, sizeof(*interner->keys));
@@ -1246,12 +1263,14 @@ void interner_resize(ApplicationInterner *interner) {
                 newcapacity);
         exit(EXIT_FAILURE);
     }
+    uint32_t mask = newcapacity - 1U;
+
     for (uint32_t i = 0; i < interner->capacity; ++i) {
         if (interner->keys[i] != 0) {
-            uint32_t index = hash64(interner->keys[i], newcapacity);
+            uint32_t index = hash64(interner->keys[i], mask);
 
             while (newkeys[index] != 0) {
-                index = (index + 1) % newcapacity;
+                index = (index + 1U) & mask;
             }
             newkeys[index] = interner->keys[i];
             newids[index] = interner->ids[i];
@@ -1270,13 +1289,14 @@ uint32_t internapplication(ApplicationInterner *interner,
         interner_resize(interner);
     }
     uint64_t key = ((uint64_t)left << 32) | right;
-    uint32_t index = hash64(key, interner->capacity);
+    uint32_t mask = interner->capacity - 1U;
+    uint32_t index = hash64(key, mask);
 
     while (interner->keys[index] != 0) {
         if (interner->keys[index] == key) {
             return interner->ids[index];
         }
-        index = (index + 1) % interner->capacity;
+        index = (index + 1U) & mask;
     }
     if (interner->nextid == 0) {
         fprintf(stderr, "canonical expression ID space exhausted\n");

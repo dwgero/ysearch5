@@ -55,7 +55,9 @@
 #define MAXBUF ((3 * MAXLEN) - 1)
 #define MAXSTR maxstr
 #define MAXSTEPS maxsteps
-#define MAXARRAY 33554432
+#define MAXARRAY (32U * 1024U)
+#define WORKER_STACK_SIZE (1024U * 1024U)
+#define MAXSTRTABLE_11 20480U
 
 #ifndef SINGLE_THREAD
 #define SINGLE_THREAD 0
@@ -179,7 +181,7 @@ uint_fast32_t maxstrtable[12] = {
     // 0    1     2     3     4     5     6
     1024, 1024, 1024, 1024, 1024, 1024, 1024,
     // 7    8     9    10    11
-    1024, 2048, 4096, 4096, 20480
+    1024, 2048, 4096, 4096, MAXSTRTABLE_11
 };
 
 uint_fast32_t maxsteptable[12] = {
@@ -193,6 +195,8 @@ _Static_assert(MAXLEN <= (sizeof(maxstrtable) / sizeof(maxstrtable[0])),
                "MAXLEN exceeds maxstrtable capacity");
 _Static_assert(MAXLEN <= (sizeof(maxsteptable) / sizeof(maxsteptable[0])),
                "MAXLEN exceeds maxsteptable capacity");
+_Static_assert(MAXSTRTABLE_11 < MAXARRAY,
+               "maxstrtable[11] must be less than MAXARRAY");
 
 uint_fast32_t maxstr = 1024;
 uint_fast32_t maxsteps = 1024;
@@ -3249,7 +3253,8 @@ void threadinit(void) {
         INT3
         exit(EXIT_FAILURE);
     }
-    if ((errno = pthread_attr_setstacksize(&threadattr, (63 * 1024 * 1024)))) {
+    if ((errno = pthread_attr_setstacksize(&threadattr,
+                                            WORKER_STACK_SIZE)) != 0) {
         fprintf(stderr, "pthread_attr_setstacksize failed: ");
         perror(NULL);
         INT3

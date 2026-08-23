@@ -242,6 +242,8 @@ atomic_int exiting = 0;
 atomic_int masterwaiting = 0;
 char workbuf[MAXTHREADS][MAXBUF + 1];
 unsigned worklen[MAXTHREADS];
+uint_fast32_t worknum[MAXTHREADS];
+unsigned workcount[MAXTHREADS];
 char threadname[MAXTHREADS][32];
 #endif
 
@@ -1661,10 +1663,94 @@ int checkforKorSK(char *buffer) {
     }
 }
 
-void dooneSK(unsigned length, char *buffer) {
+uint_fast32_t num2cell(uint_fast32_t num, int_fast32_t *position,
+                       unsigned length, unsigned count, unsigned *leafnum) {
+    int isapplication = (num & ((uint_fast32_t)1 << *position)) != 0;
+
+    *position -= 1;
+    if (!isapplication) {
+        unsigned currentleaf = (*leafnum)++;
+
+        if (currentleaf == 0) {
+            return 'S';
+        }
+        return (count & (1U << (length - currentleaf))) ? 'K' : 'S';
+    }
+
+    uint_fast32_t left = num2cell(num, position, length, count, leafnum);
+    if (left == 0) {
+        return 0;
+    }
+    uint_fast32_t right = num2cell(num, position, length, count, leafnum);
+    if (right == 0) {
+        return 0;
+    }
+    uint_fast32_t head;
+    uint_fast32_t tail;
+
+    if (left < FREEMIN) {
+        tail = getfree();
+        if (tail == 0) {
+            return 0;
+        }
+        contents[tail] = left;
+        head = tail;
+    } else {
+        tail = left;
+        head = next[tail];
+    }
+
+    uint_fast32_t newtail = getfree();
+    if (newtail == 0) {
+        return 0;
+    }
+    contents[newtail] = right;
+    next[tail] = newtail;
+    next[newtail] = head;
+    return newtail;
+}
+
+uint_fast32_t num2cells(unsigned length, uint_fast32_t num, unsigned count) {
+    int_fast32_t position = (int_fast32_t)(2 * length);
+    unsigned leafnum = 0;
+    uint_fast32_t tail = num2cell(num, &position, length, count, &leafnum);
+
+    if (tail == 0) {
+        return 0;
+    }
+    if (tail < FREEMIN) {
+        uint_fast32_t temp = getfree();
+
+        if (temp == 0) {
+            return 0;
+        }
+        contents[temp] = tail;
+        next[temp] = temp;
+        tail = temp;
+    }
+
+    uint_fast32_t xcell = getfree();
+    if (xcell == 0) {
+        return 0;
+    }
+    contents[xcell] = 'x';
+    next[xcell] = next[tail];
+    next[tail] = xcell;
+
+#if PARANOID
+    if ((position != -1) || (leafnum != (length + 1))) {
+        printf("*** Programmer error: malformed numeric expression\n");
+        INT3
+        return 0;
+    }
+#endif
+    return xcell;
+}
+
+void dooneSK(unsigned length, uint_fast32_t num, unsigned count, char *buffer) {
     setupfreelist();
     
-    uint_fast32_t bufferhead = str2cells(buffer);
+    uint_fast32_t bufferhead = num2cells(length, num, count);
     
 #if PARANOID
     if (bufferhead == 0) {
@@ -1687,7 +1773,7 @@ void dooneSK(unsigned length, char *buffer) {
     evalcells(length, bufferhead, evalhead, initlen, buffer, 0);
 }
 
-void generateallSK(unsigned length, char *buffer) {
+void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
     int index[MAXLEN + 1];
     int indexnum = (int)length;
     int maxcount = 1 << length;
@@ -1748,7 +1834,7 @@ void generateallSK(unsigned length, char *buffer) {
             pthread_mutex_unlock(&printlock);
         }
 #if SINGLE_THREAD
-        dooneSK(length, buffer);
+        dooneSK(length, num, (unsigned)count, buffer);
 #else
         uint64_t thmt = atomic_load(&threadempty);
         unsigned threadnum;
@@ -1804,6 +1890,8 @@ void generateallSK(unsigned length, char *buffer) {
         mask = (uint64_t)1 << threadnum;
         strcpy(workbuf[threadnum], buffer);
         worklen[threadnum] = length;
+        worknum[threadnum] = num;
+        workcount[threadnum] = (unsigned)count;
         (void)atomic_fetch_and(&threadempty, ~mask);
         
         /*
@@ -1836,6 +1924,8 @@ void *threadrun(void *arg) {
         }
         if ((atomic_load(&threadempty) & mask) == 0) {
             unsigned mylen = worklen[mythreadnum];
+            uint_fast32_t mynum = worknum[mythreadnum];
+            unsigned mycount = workcount[mythreadnum];
             char mybuf[MAXBUF+1];
             
             strcpy(mybuf, workbuf[mythreadnum]);
@@ -1848,7 +1938,7 @@ void *threadrun(void *arg) {
                     exit(EXIT_FAILURE);
                 }
             }
-            dooneSK(mylen, mybuf);
+            dooneSK(mylen, mynum, mycount, mybuf);
             continue;
         }
         (void)atomic_fetch_or(&threadwaiting, mask);
@@ -2174,7 +2264,7 @@ int main(void) {
             buffer[0] = '\0';
             num2str(nextnum, (int_fast32_t)(2 * length), buffer, 1);
             //puts(buffer);
-            generateallSK(length, buffer);
+            generateallSK(length, nextnum, buffer);
         }
 #if !SINGLE_THREAD
         // wait for all threads to finish

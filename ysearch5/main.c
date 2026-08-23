@@ -221,8 +221,17 @@ uint_fast32_t *nxt[MAXTHREADS];
 uint_fast32_t *cnts[MAXTHREADS];
 // An expression pointer identifies its tail cell; next[tail] identifies its
 // head cell, making the expression a circular ring. If contents < FREEMIN,
-// it is a character; otherwise it identifies the tail of a subexpression.
+// it is a character. An untagged larger value identifies the tail of an owned
+// subexpression. A value with MEMO_BIT set identifies a memo cell: the memo
+// cell's contents points to the shared subexpression tail and its next holds
+// the reference count (plus a transient evaluator busy flag).
 #define FREEMIN 256
+#define MEMO_BIT (UINT_FAST32_MAX - (UINT_FAST32_MAX >> 1))
+#define MEMO_MASK (MEMO_BIT - 1)
+_Static_assert((MEMO_BIT & (MEMO_BIT - 1)) == 0,
+               "MEMO_BIT must be the highest value bit");
+_Static_assert((uint_fast32_t)MAXARRAY < MEMO_BIT,
+               "arena indices must fit below MEMO_BIT");
 uint_fast32_t hwm[MAXTHREADS];
 uint_fast32_t frls[MAXTHREADS];
 uint_fast32_t bfln[MAXTHREADS];
@@ -288,6 +297,82 @@ void putfree(uint_fast32_t cell) {
     buflen -= 1;
 }
 
+static inline int ismemocontents(uint_fast32_t value) {
+    return (value & MEMO_BIT) != 0;
+}
+
+static inline int isdirectcontents(uint_fast32_t value) {
+    return (value >= FREEMIN) && !ismemocontents(value);
+}
+
+static inline uint_fast32_t memocell(uint_fast32_t value) {
+    return value & MEMO_MASK;
+}
+
+static inline uint_fast32_t resolvedtail(uint_fast32_t value) {
+    return ismemocontents(value) ? contents[memocell(value)] : value;
+}
+
+static inline uint_fast32_t memoreferences(uint_fast32_t memo) {
+    return next[memo] & MEMO_MASK;
+}
+
+void memoacquire(uint_fast32_t value) {
+    uint_fast32_t memo = memocell(value);
+    uint_fast32_t state = next[memo];
+
+#if PARANOID
+    if (!ismemocontents(value) || (memo < FREEMIN) ||
+        (memo >= highwatermark) || ((state & MEMO_MASK) == 0) ||
+        ((state & MEMO_MASK) == MEMO_MASK)) {
+        printf("*** Programmer error: invalid memo acquire at %" PRIuFAST32 "\n",
+               memo);
+        INT3
+        return;
+    }
+#endif
+    next[memo] = state + 1;
+}
+
+void freeall(uint_fast32_t cells);
+
+void releasecontents(uint_fast32_t value) {
+    if (value < FREEMIN) return;
+    if (isdirectcontents(value)) {
+        freeall(value);
+        return;
+    }
+
+    uint_fast32_t memo = memocell(value);
+    uint_fast32_t state = next[memo];
+    uint_fast32_t references = state & MEMO_MASK;
+
+#if PARANOID
+    if ((memo < FREEMIN) || (memo >= highwatermark) || (references == 0)) {
+        printf("*** Programmer error: invalid memo release at %" PRIuFAST32 "\n",
+               memo);
+        INT3
+        return;
+    }
+#endif
+    if (references > 1) {
+        next[memo] = state - 1;
+        return;
+    }
+#if PARANOID
+    if ((state & MEMO_BIT) != 0) {
+        printf("*** Programmer error: releasing busy memo at %" PRIuFAST32 "\n",
+               memo);
+        INT3
+        return;
+    }
+#endif
+    uint_fast32_t target = contents[memo];
+
+    freeall(target);
+    putfree(memo);
+}
+
 void freeall(uint_fast32_t cells) {
     uint_fast32_t tail = cells;
     uint_fast32_t head;
@@ -309,9 +394,7 @@ void freeall(uint_fast32_t cells) {
     for (;;) {
         uint_fast32_t temp = next[cells];
 
-        if (contents[cells] >= FREEMIN) {
-            freeall(contents[cells]);
-        }
+        releasecontents(contents[cells]);
         putfree(cells);
         if (cells == tail) {
             return;
@@ -509,7 +592,7 @@ uint_fast32_t str2cells(char *buffer) {
 void printcells(uint_fast32_t startcell) {
     uint_fast32_t tail = startcell;
     uint_fast32_t cells = next[tail];
-    uint_fast32_t curconts;
+    int first = 1;
     
 #if PARANOID
     if (cells == 0) {
@@ -518,24 +601,21 @@ void printcells(uint_fast32_t startcell) {
         return;
     }
 #endif
-    //if (cells == tail) {
-    //    printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", startcell);
-    //    return;
-    //}
-    curconts = contents[cells];
-#if PARANOID
-    if (curconts >= FREEMIN) {
-        printf("*** Programmer error: first item of cells is subcells at %" PRIuFAST32 "\n", startcell);
-        INT3
-        return;
-    }
-#endif
-    putchar((unsigned char)curconts);
     for (;;) {
-        if (cells == tail) {
-            return;
+        uint_fast32_t curconts = contents[cells];
+
+        if (curconts < FREEMIN) {
+            putchar((unsigned char)curconts);
+        } else if (first) {
+            printcells(resolvedtail(curconts));
+        } else {
+            putchar('(');
+            printcells(resolvedtail(curconts));
+            putchar(')');
         }
+        if (cells == tail) return;
         cells = next[cells];
+        first = 0;
 #if PARANOID
         if (cells == 0) {
             printf("*** Programmer error: unexpected end of cells during print at %" PRIuFAST32 "\n", startcell);
@@ -543,14 +623,6 @@ void printcells(uint_fast32_t startcell) {
             return;
         }
 #endif
-        curconts = contents[cells];
-        if (curconts < FREEMIN) {
-            putchar((unsigned char)curconts);
-        } else {
-            putchar('(');
-            printcells(curconts);
-            putchar(')');
-        }
     }
 }
 
@@ -565,7 +637,7 @@ void putcontents(uint_fast32_t conts) {
         putchar('\n');
         return;
     }
-    putcells(conts);
+    putcells(resolvedtail(conts));
 }
 
 // cells2str unused
@@ -576,7 +648,7 @@ int cells2strpos = 0;
 void cell2str(uint_fast32_t startcell) {
     uint_fast32_t tail = startcell;
     uint_fast32_t cells = next[tail];
-    uint_fast32_t curconts;
+    int first = 1;
     
 #if PARANOID
     if (cells == 0) {
@@ -585,24 +657,21 @@ void cell2str(uint_fast32_t startcell) {
         return;
     }
 #endif
-    //if (cells == tail) {
-    //    printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", startcell);
-    //    return;
-    //}
-    curconts = contents[cells];
-#if PARANOID
-    if (curconts >= FREEMIN) {
-        printf("*** Programmer error: first item of cells is subcells at %" PRIuFAST32 "\n", startcell);
-        INT3
-        return;
-    }
-#endif
-    strbuf[cells2strpos++] = (unsigned char)curconts;
     for (;;) {
-        if (cells == tail) {
-            return;
+        uint_fast32_t curconts = contents[cells];
+
+        if (curconts < FREEMIN) {
+            strbuf[cells2strpos++] = (unsigned char)curconts;
+        } else if (first) {
+            cell2str(resolvedtail(curconts));
+        } else {
+            strbuf[cells2strpos++] = '(';
+            cell2str(resolvedtail(curconts));
+            strbuf[cells2strpos++] = ')';
         }
+        if (cells == tail) return;
         cells = next[cells];
+        first = 0;
 #if PARANOID
         if (cells == 0) {
             printf("*** Programmer error: unexpected end of cells during conversion at %" PRIuFAST32 "\n", startcell);
@@ -610,14 +679,6 @@ void cell2str(uint_fast32_t startcell) {
             return;
         }
 #endif
-        curconts = contents[cells];
-        if (curconts < FREEMIN) {
-            strbuf[cells2strpos++] = (unsigned char)curconts;
-        } else {
-            strbuf[cells2strpos++] = '(';
-            cell2str(curconts);
-            strbuf[cells2strpos++] = ')';
-        }
     }
 }
 
@@ -628,12 +689,13 @@ void cells2str(uint_fast32_t cells) {
 }
 #endif
 
+uint_fast32_t clonecontents(uint_fast32_t conts);
+
 uint_fast32_t clonecells(uint_fast32_t startcell) {
     uint_fast32_t tail = startcell;
     uint_fast32_t cells = next[tail];
-    uint_fast32_t curconts;
-    uint_fast32_t newhead;
-    uint_fast32_t newtail;
+    uint_fast32_t newhead = 0;
+    uint_fast32_t newtail = 0;
     
 #if PARANOID
     if (cells == 0) {
@@ -642,29 +704,25 @@ uint_fast32_t clonecells(uint_fast32_t startcell) {
         return 0;
     }
 #endif
-    //if (cells == tail) {
-    //    printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", startcell);
-    //    return 0;
-    //}
-    curconts = contents[cells];
-#if PARANOID
-    if (curconts >= FREEMIN) {
-        printf("*** Programmer error: first item of cells is subcells at %" PRIuFAST32 "\n", startcell);
-        INT3
-        return 0;
-    }
-#endif
-    {
+    for (;;) {
         uint_fast32_t temp = getfree();
-        
+        uint_fast32_t curconts;
+
         if (temp == 0) {
             return 0;
         }
+        curconts = clonecontents(contents[cells]);
+        if (curconts == 0) {
+            putfree(temp);
+            return 0;
+        }
         contents[temp] = curconts;
-        newhead = temp;
+        if (newhead == 0) {
+            newhead = temp;
+        } else {
+            next[newtail] = temp;
+        }
         newtail = temp;
-    }
-    for (;;) {
         if (cells == tail) {
             next[newtail] = newhead;
             return newtail;
@@ -677,23 +735,6 @@ uint_fast32_t clonecells(uint_fast32_t startcell) {
             return 0;
         }
 #endif
-        curconts = contents[cells];
-        if (curconts >= FREEMIN) {
-            curconts = clonecells(curconts);
-            if (curconts == 0) {
-                return 0;
-            }
-        }
-        {
-            uint_fast32_t temp = getfree();
-            
-            if (temp == 0) {
-                return 0;
-            }
-            contents[temp] = curconts;
-            next[newtail] = temp;
-            newtail = temp;
-        }
     }
 }
 
@@ -701,94 +742,396 @@ uint_fast32_t clonecontents(uint_fast32_t conts) {
     if (conts < FREEMIN) {
         return conts;
     }
+    if (ismemocontents(conts)) {
+        memoacquire(conts);
+        return conts;
+    }
     return clonecells(conts);
+}
+
+int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int toplevel);
+
+static int equalcontents(uint_fast32_t value1, uint_fast32_t value2) {
+    if ((value1 < FREEMIN) || (value2 < FREEMIN)) {
+        return value1 == value2;
+    }
+    if (ismemocontents(value1) && (value1 == value2)) return 1;
+    return equalcells(resolvedtail(value1), resolvedtail(value2), 0) != 0;
+}
+
+typedef struct ExpressionCursor {
+    uint_fast32_t cell;
+    uint_fast32_t tail;
+    int athead;
+    const struct ExpressionCursor *continuation;
+} ExpressionCursor;
+
+// Reduction may move a direct subexpression or memo tag into the first cell of
+// a ring. Canonical observers flatten that leading span, so it denotes the same
+// left-associated application as the former character-headed representation.
+
+typedef struct {
+    uint_fast32_t memo;
+    uint_fast32_t occurrence;
+    uint_fast32_t parenttail;
+    size_t previouscontinuation;
+    size_t activecontinuation;
+    ExpressionCursor continuation;
+} MemoPathFrame;
+
+typedef struct {
+    uint_fast32_t memo;
+    uint32_t generation;
+} MemoPathMember;
+
+typedef struct {
+    MemoPathFrame *frames;
+    size_t depth;
+    size_t capacity;
+    size_t activecontinuation;
+    MemoPathMember *members;
+    size_t membercapacity;
+    size_t membercount;
+    size_t tombstones;
+    uint32_t generation;
+} MemoPath;
+
+PERTHREAD static MemoPath evaluatorpath;
+
+static void freememopath(void) {
+    free(evaluatorpath.frames);
+    free(evaluatorpath.members);
+    evaluatorpath.frames = NULL;
+    evaluatorpath.members = NULL;
+    evaluatorpath.depth = 0;
+    evaluatorpath.capacity = 0;
+    evaluatorpath.activecontinuation = 0;
+    evaluatorpath.membercapacity = 0;
+    evaluatorpath.membercount = 0;
+    evaluatorpath.tombstones = 0;
+    evaluatorpath.generation = 0;
+}
+
+static size_t memopathhash(uint_fast32_t memo, size_t capacity) {
+    uint64_t mixed = (uint64_t)memo * UINT64_C(11400714819323198485);
+
+    mixed ^= mixed >> 32;
+    return (size_t)mixed & (capacity - 1);
+}
+
+static void rehashmemopath(MemoPath *path, size_t newcapacity) {
+    MemoPathMember *newmembers = calloc(newcapacity, sizeof(*newmembers));
+
+    if (newmembers == NULL) {
+        fprintf(stderr,
+                "failed to grow memo update membership table to %zu entries\n",
+                newcapacity);
+        exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < path->membercapacity; ++i) {
+        MemoPathMember member = path->members[i];
+
+        if ((member.generation != path->generation) ||
+            (member.memo < FREEMIN)) {
+            continue;
+        }
+        size_t index = memopathhash(member.memo, newcapacity);
+
+        while (newmembers[index].memo != 0) {
+            index = (index + 1) & (newcapacity - 1);
+        }
+        newmembers[index] = member;
+    }
+    free(path->members);
+    path->members = newmembers;
+    path->membercapacity = newcapacity;
+    path->tombstones = 0;
+}
+
+static int memoinpath(const MemoPath *path, uint_fast32_t memo) {
+    if (path->membercapacity == 0) return 0;
+
+    size_t index = memopathhash(memo, path->membercapacity);
+
+    for (;;) {
+        MemoPathMember member = path->members[index];
+
+        if ((member.generation != path->generation) || (member.memo == 0)) {
+            return 0;
+        }
+        if (member.memo == memo) return 1;
+        index = (index + 1) & (path->membercapacity - 1);
+    }
+}
+
+static void insertmemopathmember(MemoPath *path, uint_fast32_t memo) {
+    if ((path->membercapacity == 0) ||
+        ((path->membercount + path->tombstones + 1) >=
+         (path->membercapacity / 2))) {
+        size_t newcapacity;
+
+        if (path->membercapacity == 0) {
+            newcapacity = 128;
+        } else if ((path->membercount + 1) <
+                   (path->membercapacity / 4)) {
+            newcapacity = path->membercapacity;
+        } else {
+            newcapacity = path->membercapacity * 2;
+        }
+
+        if ((newcapacity < path->membercapacity) ||
+            (newcapacity > (SIZE_MAX / sizeof(*path->members)))) {
+            fprintf(stderr, "memo update membership table is too large\n");
+            exit(EXIT_FAILURE);
+        }
+        rehashmemopath(path, newcapacity);
+    }
+
+    size_t index = memopathhash(memo, path->membercapacity);
+    size_t tombstone = SIZE_MAX;
+
+    for (;;) {
+        MemoPathMember *member = &path->members[index];
+
+        if (member->generation != path->generation) break;
+        if (member->memo == 1) {
+            if (tombstone == SIZE_MAX) tombstone = index;
+        } else if (member->memo == 0) {
+            break;
+        }
+        index = (index + 1) & (path->membercapacity - 1);
+    }
+    if (tombstone != SIZE_MAX) {
+        index = tombstone;
+        path->tombstones--;
+    }
+    path->members[index].memo = memo;
+    path->members[index].generation = path->generation;
+    path->membercount++;
+}
+
+static void removememopathmember(MemoPath *path, uint_fast32_t memo) {
+    size_t index = memopathhash(memo, path->membercapacity);
+
+    for (;;) {
+        MemoPathMember *member = &path->members[index];
+
+#if PARANOID
+        if ((member->generation != path->generation) || (member->memo == 0)) {
+            printf("*** Programmer error: memo update path member is missing\n");
+            INT3
+            return;
+        }
+#endif
+        if (member->memo == memo) {
+            member->memo = 1;
+            path->membercount--;
+            path->tombstones++;
+            return;
+        }
+        index = (index + 1) & (path->membercapacity - 1);
+    }
+}
+
+static void clearmemopath(MemoPath *path) {
+    path->depth = 0;
+    path->activecontinuation = 0;
+    path->membercount = 0;
+    path->tombstones = 0;
+    path->generation++;
+    if (path->generation == 0) {
+        if (path->membercapacity != 0) {
+            memset(path->members, 0,
+                   path->membercapacity * sizeof(*path->members));
+        }
+        path->generation = 1;
+    }
+}
+
+static void truncatememopath(MemoPath *path, size_t newdepth) {
+    while (path->depth > newdepth) {
+        path->depth--;
+        removememopathmember(path, path->frames[path->depth].memo);
+    }
+    path->activecontinuation =
+        newdepth ? path->frames[newdepth - 1].activecontinuation : 0;
+}
+
+static void pushmemopath(MemoPath *path, uint_fast32_t memo,
+                         uint_fast32_t occurrence, uint_fast32_t parenttail) {
+    if (path->depth == path->capacity) {
+        size_t newcapacity = path->capacity ? (path->capacity * 2) : 64;
+
+        if ((newcapacity < path->capacity) ||
+            (newcapacity > (SIZE_MAX / sizeof(*path->frames)))) {
+            fprintf(stderr, "memo update path is too large\n");
+            exit(EXIT_FAILURE);
+        }
+        MemoPathFrame *newframes =
+            realloc(path->frames, newcapacity * sizeof(*newframes));
+
+        if (newframes == NULL) {
+            fprintf(stderr,
+                    "failed to grow memo update path to %zu frames\n",
+                    newcapacity);
+            exit(EXIT_FAILURE);
+        }
+        path->frames = newframes;
+        path->capacity = newcapacity;
+        for (size_t i = 0; i < path->depth; ++i) {
+            size_t previous = path->frames[i].previouscontinuation;
+
+            path->frames[i].continuation.continuation =
+                previous ? &path->frames[previous - 1].continuation : NULL;
+        }
+    }
+    MemoPathFrame *frame = &path->frames[path->depth];
+
+    frame->memo = memo;
+    frame->occurrence = occurrence;
+    frame->parenttail = parenttail;
+    frame->previouscontinuation = path->activecontinuation;
+    if (occurrence != parenttail) {
+        frame->continuation.cell = next[occurrence];
+        frame->continuation.tail = parenttail;
+        frame->continuation.athead = 0;
+        frame->continuation.continuation = frame->previouscontinuation
+            ? &path->frames[frame->previouscontinuation - 1].continuation
+            : NULL;
+        path->activecontinuation = path->depth + 1;
+    }
+    frame->activecontinuation = path->activecontinuation;
+    path->depth++;
+    insertmemopathmember(path, memo);
+}
+
+static ExpressionCursor startcursor(uint_fast32_t tail,
+                                    const ExpressionCursor *continuation) {
+    ExpressionCursor result = {next[tail], tail, 1, continuation};
+
+    return result;
+}
+
+static ExpressionCursor advancecursor(ExpressionCursor cursor) {
+    if (cursor.cell != cursor.tail) {
+        cursor.cell = next[cursor.cell];
+        cursor.athead = 0;
+        return cursor;
+    }
+    if (cursor.continuation != NULL) return *cursor.continuation;
+    cursor.cell = 0;
+    cursor.tail = 0;
+    cursor.athead = 0;
+    cursor.continuation = NULL;
+    return cursor;
+}
+
+static int equalcursors(ExpressionCursor first, ExpressionCursor second,
+                        int toplevel) {
+    for (;;) {
+        if (first.athead && (contents[first.cell] >= FREEMIN)) {
+            ExpressionCursor continuation = advancecursor(first);
+            ExpressionCursor nested =
+                startcursor(resolvedtail(contents[first.cell]), &continuation);
+
+            return equalcursors(nested, second, toplevel);
+        }
+        if (second.athead && (contents[second.cell] >= FREEMIN)) {
+            ExpressionCursor continuation = advancecursor(second);
+            ExpressionCursor nested =
+                startcursor(resolvedtail(contents[second.cell]), &continuation);
+
+            return equalcursors(first, nested, toplevel);
+        }
+
+        uint_fast32_t value1 = contents[first.cell];
+        uint_fast32_t value2 = contents[second.cell];
+        ExpressionCursor nextfirst = advancecursor(first);
+        ExpressionCursor nextsecond = advancecursor(second);
+
+        if (!equalcontents(value1, value2)) {
+            if (toplevel && (value1 == 'x') && (nextfirst.cell == 0)) {
+                return 2;
+            }
+            return 0;
+        }
+        if (nextfirst.cell == 0) {
+            if (nextsecond.cell == 0) return 1;
+            return toplevel ? 2 : 0;
+        }
+        if (nextsecond.cell == 0) return 0;
+        first = nextfirst;
+        second = nextsecond;
+    }
+}
+
+static int equalcellspath(uint_fast32_t startcells1, uint_fast32_t startcells2,
+                          int toplevel, MemoPath *path) {
+    if (path->depth == 0) {
+        return equalcells(startcells1, startcells2, toplevel);
+    }
+
+#if PARANOID
+    if (path->frames[0].parenttail != startcells2) {
+        printf("*** Programmer error: memo path has wrong parent tail\n");
+        INT3
+        return 0;
+    }
+#endif
+
+    const ExpressionCursor *continuation = path->activecontinuation
+        ? &path->frames[path->activecontinuation - 1].continuation
+        : NULL;
+
+    ExpressionCursor first = startcursor(startcells1, NULL);
+    ExpressionCursor second =
+        startcursor(contents[path->frames[path->depth - 1].memo], continuation);
+
+    return equalcursors(first, second, toplevel);
 }
 
 // startcells1 is always bufferhead if toplevel == 1
 int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int toplevel) {
-    uint_fast32_t tail1 = startcells1;
-    uint_fast32_t tail2 = startcells2;
-    uint_fast32_t cells1 = next[tail1];
-    uint_fast32_t cells2 = next[tail2];
-    uint_fast32_t curconts1, curconts2;
-    
+    ExpressionCursor first = startcursor(startcells1, NULL);
+    ExpressionCursor second = startcursor(startcells2, NULL);
+
 #if PARANOID
-    if (cells1 == 0) {
+    if (first.cell == 0) {
         printf("*** Programmer error: unexpected end of first comparison at %" PRIuFAST32 "\n", startcells1);
         INT3
         return 0;
     }
-    if (cells2 == 0) {
+    if (second.cell == 0) {
         printf("*** Programmer error: unexpected end of second comparison at %" PRIuFAST32 "\n", startcells2);
         INT3
         return 0;
     }
 #endif
-    curconts1 = contents[cells1];
-    curconts2 = contents[cells2];
-#if PARANOID
-    if (curconts1 >= FREEMIN) {
-        printf("*** Programmer error: first item of cells is subcells at %" PRIuFAST32 "\n", startcells1);
-        INT3
-        return 0;
+    if ((contents[first.cell] >= FREEMIN) ||
+        (contents[second.cell] >= FREEMIN)) {
+        return equalcursors(first, second, toplevel);
     }
-    if (curconts2 >= FREEMIN) {
-        printf("*** Programmer error: first item of cells is subcells at %" PRIuFAST32 "\n", startcells2);
-        INT3
-        return 0;
-    }
-#endif
-    if (curconts1 != curconts2) {
-        return 0;
-    }
+
+    uint_fast32_t cell1 = first.cell;
+    uint_fast32_t cell2 = second.cell;
+
     for (;;) {
-        if (cells1 == tail1) {
-            // reached end of bufferhead if toplevel == 1
-            if (cells2 == tail2) {
-                // total match
-                return 1;
-            }
-            // match sofar to cells2, but more of cells2 left
-            if (toplevel) {
+        uint_fast32_t value1 = contents[cell1];
+        uint_fast32_t value2 = contents[cell2];
+
+        if (!equalcontents(value1, value2)) {
+            if (toplevel && (value1 == 'x') && (cell1 == startcells1)) {
                 return 2;
             }
             return 0;
         }
-        if (cells2 == tail2) {
-            return 0;
+        if (cell1 == startcells1) {
+            if (cell2 == startcells2) return 1;
+            return toplevel ? 2 : 0;
         }
-        cells1 = next[cells1];
-        cells2 = next[cells2];
-#if PARANOID
-        if (cells1 == 0) {
-            printf("*** Programmer error: unexpected end of first comparison at %" PRIuFAST32 "\n", startcells1);
-            INT3
-            return 0;
-        }
-        if (cells2 == 0) {
-            printf("*** Programmer error: unexpected end of comparison %" PRIuFAST32
-                   " against %" PRIuFAST32 "\n", startcells1, startcells2);
-            INT3
-            return 0;
-        }
-#endif
-        curconts1 = contents[cells1];
-        curconts2 = contents[cells2];
-        if (curconts1 < FREEMIN) {
-            if (curconts1 != curconts2) {
-                if (toplevel && (curconts1 == 'x') && (cells1 == tail1)) {
-                    return 2;
-                }
-                return 0;
-            }
-        } else {
-            if (curconts2 < FREEMIN) {
-                return 0;
-            }
-            if (equalcells(curconts1, curconts2, 0) == 0) {
-                return 0;
-            }
-        }
+        if (cell2 == startcells2) return 0;
+        cell1 = next[cell1];
+        cell2 = next[cell2];
     }
 }
 
@@ -981,7 +1324,7 @@ uint32_t cells2id(uint_fast32_t tail) {
 }
 
 uint32_t cellcontentid(uint_fast32_t value) {
-    if (value >= FREEMIN) return cells2id(value);
+    if (value >= FREEMIN) return cells2id(resolvedtail(value));
     if (value == 'S') return ID_S;
     if (value == 'K') return ID_K;
     if (value == 'x') return ID_X;
@@ -1016,7 +1359,7 @@ typedef struct {
 SArgumentPattern classifySargument(uint_fast32_t value) {
     SArgumentPattern pattern = {0, 0, 0, 0};
 
-    if (value < FREEMIN) return pattern;
+    if (!isdirectcontents(value)) return pattern;
 
     uint_fast32_t first = next[value];
 
@@ -1039,7 +1382,7 @@ CellSpan takeownedcell(uint_fast32_t cell) {
     CellSpan span;
     uint_fast32_t value = contents[cell];
 
-    if (value < FREEMIN) {
+    if (!isdirectcontents(value)) {
         span.head = cell;
         span.tail = cell;
     } else {
@@ -1051,7 +1394,7 @@ CellSpan takeownedcell(uint_fast32_t cell) {
 }
 
 void discardownedcell(uint_fast32_t cell) {
-    if (contents[cell] >= FREEMIN) freeall(contents[cell]);
+    releasecontents(contents[cell]);
     putfree(cell);
 }
 
@@ -1215,6 +1558,400 @@ int tryoptimizedS(uint_fast32_t scell,
     return 0;
 }
 
+static int islegacySKapplication(uint_fast32_t value) {
+    if (!isdirectcontents(value)) return 0;
+
+    uint_fast32_t first = next[value];
+    uint_fast32_t second;
+    uint_fast32_t third;
+
+    if ((first == 0) || (first == value)) return 0;
+    second = next[first];
+    if ((second == 0) || (second == value)) return 0;
+    third = next[second];
+    if (third != value) return 0;
+    return (contents[first] == 'S') && (contents[second] == 'K');
+}
+
+// Give zcell and duplicate one reference each to the same subexpression.
+// The original owned ring moves into a new memo cell; an existing memo is
+// simply retained. Characters remain immediate values.
+static int shareScontents(uint_fast32_t zcell, uint_fast32_t *duplicate) {
+    uint_fast32_t value = contents[zcell];
+
+    if (value < FREEMIN) {
+        *duplicate = value;
+        return 1;
+    }
+    if (ismemocontents(value)) {
+        memoacquire(value);
+        *duplicate = value;
+        return 1;
+    }
+
+    uint_fast32_t memo = getfree();
+
+    if (memo == 0) return 0;
+    contents[memo] = value;
+    next[memo] = 2;
+    value = MEMO_BIT | memo;
+    contents[zcell] = value;
+    *duplicate = value;
+    return 1;
+}
+
+static int taggedSshortcutshape(uint_fast32_t value, int allowlegacy) {
+    if (!ismemocontents(value)) return 0;
+
+    uint_fast32_t tail = resolvedtail(value);
+    uint_fast32_t first = next[tail];
+
+    if (first == tail) return contents[first] == 'K';
+    uint_fast32_t second = next[first];
+    if (second == tail) {
+        return ((contents[first] == 'S') && (contents[second] == 'K')) ||
+               (contents[first] == 'K');
+    }
+    return allowlegacy && (next[second] == tail) &&
+           (contents[first] == 'S') && (contents[second] == 'K');
+}
+
+// Shortcut code consumes argument rings destructively. If a tagged argument
+// has a recognized shortcut shape, give this occurrence a private copy first.
+// A one-cell K target can become the immediate K value directly.
+static int prepareSshortcutargument(uint_fast32_t cell, int allowlegacy) {
+    uint_fast32_t value = contents[cell];
+
+    if (!taggedSshortcutshape(value, allowlegacy)) return 1;
+
+    uint_fast32_t target = resolvedtail(value);
+    uint_fast32_t first = next[target];
+
+    if ((first == target) && (contents[first] == 'K')) {
+        releasecontents(value);
+        contents[cell] = 'K';
+        return 1;
+    }
+
+    uint_fast32_t copy = clonecells(target);
+
+    if (copy == 0) return 0;
+    releasecontents(value);
+    contents[cell] = copy;
+    return 1;
+}
+
+// Reduce one S or K redex at the front of an open linear chain. The returned
+// cost includes contractions performed algebraically by the existing direct S
+// shortcuts. A zero result means weak-head form; -1 means arena exhaustion.
+static int reducetop(uint_fast32_t *headptr, uint_fast32_t *tailptr,
+                     uint_fast32_t *cost) {
+    uint_fast32_t head = *headptr;
+    uint_fast32_t tail = *tailptr;
+    uint_fast32_t curchar = contents[head];
+
+    *cost = 0;
+    if (curchar == 'S') {
+        uint_fast32_t xcell = next[head];
+
+        if (xcell == 0) return 0;
+        uint_fast32_t ycell = next[xcell];
+        if (ycell == 0) return 0;
+        uint_fast32_t zcell = next[ycell];
+        if (zcell == 0) return 0;
+
+        uint_fast32_t rest = next[zcell];
+        uint_fast32_t x;
+        uint_fast32_t y;
+        uint_fast32_t z = contents[zcell];
+        uint_fast32_t optimizedsteps;
+
+        if (!prepareSshortcutargument(xcell, 0)) return -1;
+        x = contents[xcell];
+        if ((x != 'K') && !prepareSshortcutargument(ycell, 1)) return -1;
+        y = contents[ycell];
+
+        if (tryoptimizedS(head, xcell, x, ycell, y, zcell, rest, &head,
+                          &tail, &optimizedsteps)) {
+            *headptr = head;
+            *tailptr = tail;
+            *cost = optimizedsteps + 1;
+            return 1;
+        }
+
+        uint_fast32_t xhead = xcell;
+        uint_fast32_t xtail = xcell;
+        uint_fast32_t yhead = ycell;
+        uint_fast32_t ytail = ycell;
+        uint_fast32_t savey = ycell;
+        uint_fast32_t needtofreex = 0;
+        int gotSK = islegacySKapplication(y);
+
+        if (isdirectcontents(x)) {
+            needtofreex = xcell;
+            xhead = next[x];
+            xtail = x;
+        }
+        if (isdirectcontents(y)) {
+            yhead = next[y];
+            ytail = y;
+        }
+
+        putfree(head);
+        head = xhead;
+        next[xtail] = zcell;
+
+        if (gotSK) {
+            // (SK<any>) z -> z, leaving x z z. This pre-existing shortcut
+            // keeps its direct clone behavior; generic S is memoized below.
+            uint_fast32_t duplicate = clonecontents(z);
+
+            if (duplicate == 0) {
+                *headptr = head;
+                *tailptr = tail;
+                return -1;
+            }
+            contents[savey] = duplicate;
+            next[savey] = rest;
+            next[zcell] = savey;
+            if (rest == 0) tail = savey;
+            freeall(y);
+            *cost = 3;
+        } else {
+            uint_fast32_t duplicate;
+
+            if (!shareScontents(zcell, &duplicate)) {
+                *headptr = head;
+                *tailptr = tail;
+                return -1;
+            }
+            // A direct y ring is transferred and its old wrapper can become
+            // the duplicate-z cell. Characters and memo tags retain their
+            // occurrence cell, so they need a new cell for duplicate z.
+            if (!isdirectcontents(y)) {
+                savey = getfree();
+                if (savey == 0) {
+                    *headptr = head;
+                    *tailptr = tail;
+                    return -1;
+                }
+            }
+            contents[savey] = duplicate;
+            next[savey] = yhead;
+            next[ytail] = savey;
+
+            uint_fast32_t wrapper = getfree();
+            if (wrapper == 0) {
+                *headptr = head;
+                *tailptr = tail;
+                return -1;
+            }
+            next[zcell] = wrapper;
+            contents[wrapper] = savey;
+            next[wrapper] = rest;
+            if (rest == 0) tail = wrapper;
+            *cost = 1;
+        }
+        if (needtofreex) putfree(needtofreex);
+        *headptr = head;
+        *tailptr = tail;
+        return 1;
+    }
+
+    if (curchar == 'K') {
+        uint_fast32_t xcell = next[head];
+
+        if (xcell == 0) return 0;
+        uint_fast32_t ycell = next[xcell];
+        if (ycell == 0) return 0;
+
+        uint_fast32_t rest = next[ycell];
+        uint_fast32_t x = contents[xcell];
+        uint_fast32_t xhead = xcell;
+        uint_fast32_t xtail = xcell;
+        uint_fast32_t needtofreex = 0;
+
+        if (isdirectcontents(x)) {
+            needtofreex = xcell;
+            xhead = next[x];
+            xtail = x;
+        }
+        putfree(head);
+        head = xhead;
+        releasecontents(contents[ycell]);
+        putfree(ycell);
+        next[xtail] = rest;
+        if (rest == 0) tail = xtail;
+        if (needtofreex) putfree(needtofreex);
+
+        *headptr = head;
+        *tailptr = tail;
+        *cost = 1;
+        return 1;
+    }
+    return 0;
+}
+
+enum HeadExposure {
+    HEAD_ERROR = -1,
+    HEAD_READY = 0,
+    HEAD_PROGRESS = 1,
+    HEAD_CHANGED = 2
+};
+
+static int exposehead(uint_fast32_t *headptr, uint_fast32_t *tailptr,
+                      uint_fast32_t *cost, uint_fast32_t *resumememo,
+                      MemoPath *path);
+
+// Advance one shared target contraction in isolation. Keeping this to one
+// evaluator turn preserves the outer evaluator's repeat/winner observations.
+static int forcememoone(uint_fast32_t memo, uint_fast32_t *cost,
+                        uint_fast32_t *resumememo, MemoPath *path) {
+    uint_fast32_t state = next[memo];
+
+    *cost = 0;
+    if ((state & MEMO_BIT) != 0) return HEAD_ERROR;
+    next[memo] = state | MEMO_BIT;
+
+    uint_fast32_t tail = contents[memo];
+    uint_fast32_t head = next[tail];
+    int result;
+
+    next[tail] = 0;
+    result = exposehead(&head, &tail, cost, resumememo, path);
+    if (result == HEAD_READY) {
+        int reduced = reducetop(&head, &tail, cost);
+
+        if (reduced < 0) {
+            result = HEAD_ERROR;
+        } else if (reduced > 0) {
+            result = HEAD_PROGRESS;
+            *resumememo = memo;
+        }
+    }
+    next[tail] = head;
+    contents[memo] = tail;
+    next[memo] &= MEMO_MASK;
+    return result;
+}
+
+static int ringisweakhead(uint_fast32_t tail) {
+    uint_fast32_t head = next[tail];
+    uint_fast32_t value = contents[head];
+
+    if (value >= FREEMIN) return 0;
+    if (value == 'K') {
+        return (head == tail) || (next[head] == tail);
+    }
+    if (value == 'S') {
+        if (head == tail) return 1;
+        uint_fast32_t firstargument = next[head];
+
+        return (firstargument == tail) || (next[firstargument] == tail);
+    }
+    return 1;
+}
+
+// Perform only zero-cost head exposure. Calling this immediately before the
+// evaluator observation makes a just-produced tagged head look like the old
+// privately cloned representation without reducing a shared target early.
+static int exposeweakhead(uint_fast32_t *headptr, uint_fast32_t *tailptr) {
+    int changed = 0;
+
+    for (;;) {
+        uint_fast32_t occurrence = *headptr;
+        uint_fast32_t value = contents[occurrence];
+
+        if (value < FREEMIN) return changed ? HEAD_CHANGED : HEAD_READY;
+
+        uint_fast32_t rest = next[occurrence];
+        uint_fast32_t replacement;
+
+        if (isdirectcontents(value)) {
+            replacement = value;
+        } else {
+            uint_fast32_t memo = memocell(value);
+            uint_fast32_t state = next[memo];
+
+            if ((state & MEMO_BIT) != 0) return HEAD_ERROR;
+            if (memoreferences(memo) == 1) {
+                replacement = contents[memo];
+                putfree(memo);
+            } else {
+                if (!ringisweakhead(contents[memo])) return HEAD_READY;
+                replacement = clonecells(contents[memo]);
+                if (replacement == 0) return HEAD_ERROR;
+                releasecontents(value);
+            }
+        }
+
+        uint_fast32_t replacementhead = next[replacement];
+
+        next[replacement] = rest;
+        if (occurrence == *tailptr) *tailptr = replacement;
+        putfree(occurrence);
+        *headptr = replacementhead;
+        changed = 1;
+    }
+}
+
+// Remove leading parentheses/indirections from an open chain. Direct owned
+// rings can be transferred. A last memo reference can likewise be stolen;
+// otherwise its target advances to weak-head form in isolation and is cloned
+// only after it is stable, so outer arguments never contaminate shared state.
+static int exposehead(uint_fast32_t *headptr, uint_fast32_t *tailptr,
+                      uint_fast32_t *cost, uint_fast32_t *resumememo,
+                      MemoPath *path) {
+    int changed = 0;
+
+    *cost = 0;
+    for (;;) {
+        uint_fast32_t occurrence = *headptr;
+        uint_fast32_t value = contents[occurrence];
+
+        if (value < FREEMIN) return changed ? HEAD_CHANGED : HEAD_READY;
+
+        uint_fast32_t rest = next[occurrence];
+        uint_fast32_t replacement;
+
+        if (isdirectcontents(value)) {
+            replacement = value;
+        } else {
+            uint_fast32_t memo = memocell(value);
+            uint_fast32_t state = next[memo];
+
+            if ((state & MEMO_BIT) != 0) return HEAD_ERROR;
+            if (memoreferences(memo) == 1) {
+                replacement = contents[memo];
+                putfree(memo);
+            } else {
+                size_t olddepth = path->depth;
+                int forced;
+
+                if (memoinpath(path, memo)) return HEAD_ERROR;
+                pushmemopath(path, memo, occurrence, *tailptr);
+                do {
+                    forced = forcememoone(memo, cost, resumememo, path);
+                } while (forced == HEAD_CHANGED);
+
+                if (forced != HEAD_READY) return forced;
+                truncatememopath(path, olddepth);
+                replacement = clonecells(contents[memo]);
+                if (replacement == 0) return HEAD_ERROR;
+                releasecontents(value);
+            }
+        }
+
+        uint_fast32_t replacementhead = next[replacement];
+
+        next[replacement] = rest;
+        if (occurrence == *tailptr) *tailptr = replacement;
+        putfree(occurrence);
+        *headptr = replacementhead;
+        changed = 1;
+    }
+}
+
 #define RESTOREHEAD \
 if (gotx) { \
     next[tail] = head; \
@@ -1238,6 +1975,11 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
     uint_fast32_t curconts;
     uint_fast32_t subhead = 0;
     uint_fast32_t subowner = 0;
+    uint_fast32_t submemo = 0;
+    uint_fast32_t resumememo = 0;
+    MemoPath *path = &evaluatorpath;
+
+    clearmemopath(path);
     
 #if 0
     putcells(evalhead);
@@ -1260,18 +2002,46 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
         return;
     }
 #endif
+
     while (steps < MAXSTEPS) {
-        uint_fast32_t x, y, z;
-        uint_fast32_t xhead, yhead, zhead;
-        uint_fast32_t xtail, ytail, ztail;
-        uint_fast32_t rest;
-        uint_fast32_t curchar;
-        
+        uint_fast32_t reductioncost = 0;
+        int exposed;
+
+        if (resumememo != 0) {
+            uint_fast32_t memo = resumememo;
+
+            resumememo = 0;
+            do {
+                exposed = forcememoone(memo, &reductioncost, &resumememo,
+                                       path);
+            } while (exposed == HEAD_CHANGED);
+            if (exposed == HEAD_READY) {
+                clearmemopath(path);
+                exposed = exposehead(&head, &tail, &reductioncost,
+                                     &resumememo, path);
+            }
+        } else {
+            exposed = exposehead(&head, &tail, &reductioncost, &resumememo,
+                                 path);
+        }
+
+        if (exposed == HEAD_ERROR) {
+            steps = MAXSTEPS;
+            break;
+        }
+        if (exposed == HEAD_PROGRESS) {
+            steps += reductioncost;
+            goto reductionobserved;
+        }
+        if (exposed == HEAD_CHANGED) goto reductionobserved;
+
         cells = head;
 #if PARANOID
         if (cells == 0) {
             RESTOREHEAD
-            printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
+            if (submemo) next[submemo] &= MEMO_MASK;
+            printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n",
+                   evalhead);
             INT3
             return;
         }
@@ -1280,449 +2050,102 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
 #if PARANOID
         if (curconts >= FREEMIN) {
             RESTOREHEAD
-            printf("*** Programmer error: first item of cells is subcells at %" PRIuFAST32 "\n", evalhead);
+            if (submemo) next[submemo] &= MEMO_MASK;
+            printf("*** Programmer error: unresolved head at %" PRIuFAST32 "\n",
+                   evalhead);
             INT3
             return;
         }
 #endif
-        curchar = curconts;
-        if (curchar == 'S') {
-            int gotSK = 0;
-            uint_fast32_t needtofreex = 0;
-            uint_fast32_t savey;
-            
-            if (cells == tail) {
-                break;
-            }
-            cells = next[cells];
-#if PARANOID
-            if (cells == 0) {
-                RESTOREHEAD
-                printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
-                INT3
-                return;
-            }
-#endif
-            // x
-            xhead = xtail = cells;
-            x = contents[cells];
-            if (cells == tail) {
-                break;
-            }
-            cells = next[cells];
-#if PARANOID
-            if (cells == 0) {
-                RESTOREHEAD
-                printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
-                INT3
-                return;
-            }
-#endif
-            // y
-            yhead = ytail = cells;
-            y = contents[cells];
-            if (cells == tail) {
-                break;
-            }
-            cells = next[cells];
-#if PARANOID
-            if (cells == 0) {
-                RESTOREHEAD
-                printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
-                INT3
-                return;
-            }
-#endif
-            // z
-            zhead = ztail = cells;
-            z = contents[cells];
-            rest = next[cells];
-            // got x, y, and z, do S
-            uint_fast32_t optimizedsteps;
 
-            if (tryoptimizedS(head, xhead, x, yhead, y, zhead, rest, &head,
-                              &tail, &optimizedsteps)) {
-                steps += optimizedsteps;
-                goto sreduced;
-            }
-            if (x >= FREEMIN) {
-                needtofreex = xhead;
-                xhead = next[x];
-                xtail = x;
-#if PARANOID
-                if (xhead == 0) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", x);
-                    INT3
-                    return;
-                }
-#endif
-                if (xhead == xtail) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", x);
-                    INT3
-                    return;
-                }
-            }
-            savey = yhead;
-            if (y >= FREEMIN) {
-                uint_fast32_t cury;
-                
-                yhead = next[y];
-                ytail = y;
-#if PARANOID
-                if (yhead == 0) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", y);
-                    INT3
-                    return;
-                }
-#endif
-                if (yhead == ytail) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", y);
-                    INT3
-                    return;
-                }
-                cury = yhead;
-                curconts = contents[cury];
-                if (curconts >= FREEMIN) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: first item of cells is subcells at %" PRIuFAST32 "\n", y);
-                    INT3
-                    return;
-                }
-                curchar = curconts;
-                if (curchar == 'S') {
-                    cury = next[cury];
-#if PARANOID
-                    if (cury == 0) {
-                        RESTOREHEAD
-                        printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", y);
-                        INT3
-                        return;
-                    }
-#endif
-                    if (cury != ytail) {
-                        curconts = contents[cury];
-                        if (curconts < FREEMIN) {
-                            curchar = curconts;
-                            if (curchar == 'K') {
-                                cury = next[cury];
-#if PARANOID
-                                if (cury == 0) {
-                                    RESTOREHEAD
-                                    printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", y);
-                                    INT3
-                                    return;
-                                }
-#endif
-                                if (cury == ytail) {
-                                    gotSK = 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // free up S from head
-            putfree(head);
-            // copy x without outermost parens
-            head = xhead;
-            //printf("head:%" PRIuFAST32 "\n", head);
-#if 0
-            printf("x:");
-            putcontents(x);
-#endif
-            // copy z
-            next[xtail] = zhead;
-            //printf("xhead:%" PRIuFAST32 " xtail:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
-            //       xhead, xtail, contents[xtail], zhead);
-#if 0
-            printf("z:");
-            if (z < FREEMIN) {
-                putcontents(z);
-            } else {
-                putchar('(');
-                printcells(z);
-                putchar(')');
-                putchar('\n');
-            }
-#endif
-            if (gotSK) {
-                // y == (SK[something])
-                // (y z) == (z) == z
-                // copy clone of z
-                uint_fast32_t temp = clonecontents(z);
-                
-                if (temp == 0) {
-                    steps = MAXSTEPS;
-                    break;
-                }
-#if 0
-                printf("gotSK, clonecontents(z) at %" PRIuFAST32 ":", temp);
-                if (temp < FREEMIN) {
-                    putcontents(temp);
-                } else {
-                    putchar('(');
-                    printcells(temp);
-                    putchar(')');
-                    putchar('\n');
-                }
-#endif
-                // reuse savey
-                contents[savey] = temp;
-                next[savey] = rest;
-                //printf("savey:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n", savey, temp, rest);
-                next[ztail] = savey;
-                //printf("zhead:%" PRIuFAST32 " ztail:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
-                //       zhead, ztail, contents[ztail], savey);
-                //printf("rest:%" PRIuFAST32 " tail was:%" PRIuFAST32 "\n", rest, tail);
-                if (rest == 0) {
-                    tail = savey;
-                }
-                //printf(" tail now:%" PRIuFAST32 "\n", tail);
-                if (y >= FREEMIN) {
-                    freeall(y);
-                }
-                steps += 2;
-            } else {
-                // normal (y z)
-#if 0
-                printf("y:");
-                putcontents(y);
-#endif
-                // copy clone of z
-                uint_fast32_t temp = clonecontents(z);
-                
-                if (temp == 0) {
-                    steps = MAXSTEPS;
-                    break;
-                }
-#if 0
-                printf("normal (y z), clonecontents(z) at %" PRIuFAST32 ":", temp);
-                if (temp < FREEMIN) {
-                    putcontents(temp);
-                } else {
-                    putchar('(');
-                    printcells(temp);
-                    putchar(')');
-                    putchar('\n');
-                }
-#endif
-                // maybe reuse savey
-                if (y < FREEMIN) {
-                    savey = getfree();
-                    if (savey == 0) {
-                        steps = MAXSTEPS;
-                        break;
-                    }
-                }
-                contents[savey] = temp;
-                next[savey] = yhead;
-                //printf("savey:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
-                //       savey, temp, yhead);
-                next[ytail] = savey;
-                //printf("yhead:%" PRIuFAST32 " ytail:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
-                //       yhead, ytail, contents[ytail], savey);
-                temp = getfree();
-                if (temp == 0) {
-                    steps = MAXSTEPS;
-                    break;
-                }
-                next[ztail] = temp;
-                //printf("ztail:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
-                //       ztail, contents[ztail], temp);
-                contents[temp] = savey;
-                next[temp] = rest;
-                //printf("temp:%" PRIuFAST32 " contents:%" PRIuFAST32 " next:%" PRIuFAST32 "\n",
-                //       temp, savey, rest);
-                if (rest == 0) {
-                    tail = temp;
-                }
-#if 0
-                return;
-#endif
-            }
-#if 0
-            printf("(y z):");
-            {
-                uint_fast32_t temp = next[ztail];
-                
-#if PARANOID
-                if (temp == 0) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
-                    INT3
-                    return;
-                }
-#endif
-                temp = contents[temp];
-                if (temp < FREEMIN) {
-                    putcontents(temp);
-                } else {
-                    putchar('(');
-                    printcells(temp);
-                    putchar(')');
-                    putchar('\n');
-                }
-            }
-#endif
-            if (needtofreex) {
-                putfree(needtofreex);
-            }
-sreduced:
-            ;
-        } else if (curchar == 'K') {
-            uint_fast32_t needtofreex = 0;
-            
-            if (cells == tail) {
-                break;
-            }
+        int reduced = reducetop(&head, &tail, &reductioncost);
+
+        if (reduced < 0) {
+            steps = MAXSTEPS;
+            break;
+        }
+        if (reduced > 0) {
+            steps += reductioncost;
+            goto reductionobserved;
+        }
+
+        if (curconts == 'x') {
+            // x is only special at the head of a two-item expression.
+            if (gotx || (cells == tail)) break;
             cells = next[cells];
-#if PARANOID
-            if (cells == 0) {
-                RESTOREHEAD
-                printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
-                INT3
-                return;
-            }
-#endif
-            // x
-            xhead = xtail = cells;
-            x = contents[cells];
-            if (cells == tail) {
-                break;
-            }
-            cells = next[cells];
-#if PARANOID
-            if (cells == 0) {
-                RESTOREHEAD
-                printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
-                INT3
-                return;
-            }
-#endif
-            // y
-            yhead = cells;
-            y = contents[cells];
-            rest = next[cells];
-            // got x and y, do K
-            if (x >= FREEMIN) {
-                needtofreex = xhead;
-                xhead = next[x];
-                xtail = x;
-#if PARANOID
-                if (xhead == 0) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", x);
-                    INT3
-                    return;
-                }
-#endif
-                if (xhead == xtail) {
-                    RESTOREHEAD
-                    printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", x);
-                    INT3
-                    return;
-                }
-            }
-            // free up K from head
-            putfree(head);
-            // copy x without outermost parens
-            head = xhead;
-#if 0
-            printf("x:");
-            putcontents(x);
-#endif
-            // y isn't copied
-            putfree(yhead);
-            if (y >= FREEMIN) {
-                freeall(y);
-            }
-            next[xtail] = rest;
-            if (rest == 0) {
-                tail = xtail;
-            }
-            if (needtofreex) {
-                putfree(needtofreex);
-            }
-        } else if (curchar == 'x') {
-            // x only allowed at head of list
-            if (gotx) {
-                break;
-            }
-            if (cells == tail) {
-                break;
-            }
-            cells = next[cells];
-#if PARANOID
-            if (cells == 0) {
-                printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n", evalhead);
-                INT3
-                return;
-            }
-#endif
-            if (cells != tail) {
-                break;
-            }
+            if ((cells == 0) || (cells != tail)) break;
             curconts = contents[cells];
-            if (curconts < FREEMIN) {
-                break;
-            }
-            // restart evaluation at curconts
+            if (curconts < FREEMIN) break;
+
             next[tail] = head;
             evalhead = tail;
-            subowner = cells;
-            head = next[curconts];
-            tail = curconts;
-#if PARANOID
-            if (head == tail) {
-                printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", evalhead);
-                INT3
-                return;
+            if (ismemocontents(curconts)) {
+                submemo = memocell(curconts);
+                if ((next[submemo] & MEMO_BIT) != 0) {
+                    steps = MAXSTEPS;
+                    break;
+                }
+                next[submemo] |= MEMO_BIT;
+                subowner = submemo;
+                tail = contents[submemo];
+            } else {
+                subowner = cells;
+                tail = curconts;
             }
-#endif
-            subhead = curconts;
+            head = next[tail];
+            subhead = tail;
             gotx = 1;
-            if (equalcells(bufferhead, subhead, 0) == 0) {
+            if (equalcellspath(bufferhead, subhead, 0, path) == 0) {
                 next[tail] = 0;
                 continue;
             }
-        } else {
-            puts(buffer);
-            putchar('=');
-            RESTOREHEAD
-            putcells(evalhead);
-            fprintf(stderr, "*** Programmer error: not S, K, or x at %" PRIuFAST32 "\n", evalhead);
-            INT3
-            return;
+            reductioncost = 1;
+            steps += reductioncost;
+            goto reductionobserved;
+        }
+
+        if ((curconts == 'S') || (curconts == 'K')) break;
+
+        puts(buffer);
+        putchar('=');
+        RESTOREHEAD
+        if (submemo) next[submemo] &= MEMO_MASK;
+        putcells(evalhead);
+        fprintf(stderr, "*** Programmer error: not S, K, or x at %" PRIuFAST32 "\n",
+                evalhead);
+        INT3
+        return;
+
+reductionobserved:
+        {
+            int weakheadexposed = exposeweakhead(&head, &tail);
+
+            if (weakheadexposed == HEAD_ERROR) {
+                steps = MAXSTEPS;
+            } else if (weakheadexposed == HEAD_CHANGED) {
+                resumememo = 0;
+                clearmemopath(path);
+            }
         }
         RESTOREHEAD
-#if 0
-        putchar('=');
-        putcells(evalhead);
-#endif
-        steps += 1;
         if (gotx) {
-            if (equalcells(bufferhead, subhead, 0)) {
+            if (equalcellspath(bufferhead, subhead, 0, path)) {
                 gotwinner = 1;
                 break;
             }
         } else {
-            repeatsforever = equalcells(bufferhead, evalhead, 1);
-            if (repeatsforever) {
-                break;
-            }
+            repeatsforever = equalcellspath(bufferhead, evalhead, 1, path);
+            if (repeatsforever) break;
         }
-        // Evaluator mutations use a temporary linear chain. RESTOREHEAD closes
-        // the ring for comparison, so reopen it before the next reduction.
+        // Reducer mutations use a temporary linear chain. Close it for the
+        // structural observations above, then reopen it for another turn.
         next[tail] = 0;
     }
 
     uint_fast32_t peakcells = peakbuflen - initlen;
 
     RESTOREHEAD
+    if (submemo) next[submemo] &= MEMO_MASK;
     if (steps == 0) {
         if (atomic_load(&bufmaxis0)) {
             pthread_mutex_lock(&globallock);
@@ -2269,6 +2692,7 @@ void *threadrun(void *arg) {
             }
         }
     }
+    freememopath();
     return NULL;
 }
 
@@ -2622,6 +3046,7 @@ int main(void) {
     set_destroy(neverends);
     interner_destroy(expressions);
 #endif
+    freememopath();
     if (ISATTY(FILENO(stdin))) {
         puts("\nPress any key to exit");
         getchar();

@@ -240,10 +240,10 @@ _Static_assert((MEMO_BIT & (MEMO_BIT - 1)) == 0,
                "MEMO_BIT must be the highest value bit");
 _Static_assert((uint_fast32_t)MAXARRAY < MEMO_BIT,
                "arena indices must fit below MEMO_BIT");
-typedef uint64_t ExpressionKey;
 
 _Atomic(uint_fast32_t) repeatcount = 0;
 _Atomic(uint_fast32_t) nevercount = 0;
+_Atomic(uint_fast32_t) totalinfinitecount = 0;
 _Atomic(uint_fast32_t) checked = 0;
 atomic_int initdone = 0;
 
@@ -261,7 +261,6 @@ typedef struct {
     char buffer[MAXBUF + 1];
     int index[MAXLEN];
     unsigned counts[WORK_BATCH_CAPACITY];
-    ExpressionKey expressionkeys[WORK_BATCH_CAPACITY];
 } WorkBatch;
 
 pthread_t thread[MAXTHREADS];
@@ -1195,206 +1194,6 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
     }
 }
 
-// Exact canonical keys store the two-bit preorder grammar in the low 58 bits
-// and its payload width in the high six bits. Leading application tokens are
-// therefore retained even though their value is zero.
-#define NEVERENDS_CAPACITY 1048576U
-#define EXPRESSION_KEY_LENGTH_BITS 6U
-#define EXPRESSION_KEY_LENGTH_SHIFT (64U - EXPRESSION_KEY_LENGTH_BITS)
-#define EXPRESSION_KEY_PAYLOAD_BITS EXPRESSION_KEY_LENGTH_SHIFT
-#define EXPRESSION_KEY_PAYLOAD_MASK \
-    (UINT64_MAX >> EXPRESSION_KEY_LENGTH_BITS)
-#define EXPRESSION_KEY_TOKEN_BITS 2U
-#define EXPRESSION_TOKEN_APPLICATION UINT64_C(0)
-#define EXPRESSION_TOKEN_S UINT64_C(1)
-#define EXPRESSION_TOKEN_K UINT64_C(2)
-#define EXPRESSION_TOKEN_X UINT64_C(3)
-#define EXPRESSION_LEAF_KEY(token) \
-    ((((ExpressionKey)EXPRESSION_KEY_TOKEN_BITS) << \
-      EXPRESSION_KEY_LENGTH_SHIFT) | (ExpressionKey)(token))
-#define EXPRESSION_KEY_S EXPRESSION_LEAF_KEY(EXPRESSION_TOKEN_S)
-#define EXPRESSION_KEY_K EXPRESSION_LEAF_KEY(EXPRESSION_TOKEN_K)
-#define EXPRESSION_KEY_X EXPRESSION_LEAF_KEY(EXPRESSION_TOKEN_X)
-
-_Static_assert((NEVERENDS_CAPACITY != 0U) &&
-               ((NEVERENDS_CAPACITY & (NEVERENDS_CAPACITY - 1U)) == 0),
-               "never-ending set capacity must be a power of two");
-_Static_assert(((4U * MAXLEN) - 2U) <=
-               EXPRESSION_KEY_PAYLOAD_BITS,
-               "MAXLEN expressions must fit in packed canonical keys");
-
-typedef struct {
-    ExpressionKey *keys;
-    uint32_t capacity;
-    uint32_t size;
-} ExpressionKeySet;
-
-static inline int validhashcapacity(uint32_t capacity) {
-    return (capacity != 0) && ((capacity & (capacity - 1)) == 0);
-}
-
-static inline uint32_t hash64(uint64_t value, uint32_t mask) {
-    value ^= value >> 33;
-    value *= UINT64_C(0xff51afd7ed558ccd);
-    value ^= value >> 33;
-    value *= UINT64_C(0xc4ceb9fe1a85ec53);
-    value ^= value >> 33;
-    return (uint32_t)value & mask;
-}
-
-static inline unsigned expressionkeybits(ExpressionKey key) {
-    return (unsigned)(key >> EXPRESSION_KEY_LENGTH_SHIFT);
-}
-
-#if PARANOID
-static int validexpressionkey(ExpressionKey key) {
-    unsigned bits = expressionkeybits(key);
-    ExpressionKey payload = key & EXPRESSION_KEY_PAYLOAD_MASK;
-
-    if ((bits < EXPRESSION_KEY_TOKEN_BITS) ||
-        (bits > EXPRESSION_KEY_PAYLOAD_BITS) ||
-        ((bits % EXPRESSION_KEY_TOKEN_BITS) != 0)) {
-        return 0;
-    }
-    return (bits == EXPRESSION_KEY_PAYLOAD_BITS) ||
-           ((payload >> bits) == 0);
-}
-#endif
-
-static inline ExpressionKey applicationkey(ExpressionKey left,
-                                             ExpressionKey right) {
-    unsigned leftbits = expressionkeybits(left);
-    unsigned rightbits = expressionkeybits(right);
-    unsigned resultbits = EXPRESSION_KEY_TOKEN_BITS + leftbits + rightbits;
-
-#if PARANOID
-    if (!validexpressionkey(left) || !validexpressionkey(right)) {
-        fprintf(stderr, "invalid packed canonical expression key\n");
-        INT3
-        exit(EXIT_FAILURE);
-    }
-#endif
-    if (resultbits > EXPRESSION_KEY_PAYLOAD_BITS) {
-        fprintf(stderr,
-                "canonical expression exceeds packed-key capacity of %u bits\n",
-                EXPRESSION_KEY_PAYLOAD_BITS);
-        exit(EXIT_FAILURE);
-    }
-    ExpressionKey payload =
-        ((left & EXPRESSION_KEY_PAYLOAD_MASK) << rightbits) |
-        (right & EXPRESSION_KEY_PAYLOAD_MASK);
-
-    return ((ExpressionKey)resultbits << EXPRESSION_KEY_LENGTH_SHIFT) |
-           payload;
-}
-
-ExpressionKeySet *keyset_create(uint32_t capacity) {
-    if (!validhashcapacity(capacity)) return NULL;
-    ExpressionKeySet *set = malloc(sizeof(*set));
-    if (set == NULL) return NULL;
-    set->keys = calloc(capacity, sizeof(*set->keys));
-    if (set->keys == NULL) {
-        free(set);
-        return NULL;
-    }
-    set->capacity = capacity;
-    set->size = 0;
-    return set;
-}
-
-ExpressionKeySet *neverends;
-
-int keyset_add(ExpressionKeySet *set, ExpressionKey key) {
-    if (key == 0) {
-        fprintf(stderr,
-                "cannot add an empty packed key to the never-ending expression set\n");
-        exit(EXIT_FAILURE);
-    }
-    if (set->size >= (set->capacity / 2U)) {
-        fprintf(stderr,
-                "never-ending expression set reached its maximum size of %" PRIu32 " entries\n",
-                set->capacity / 2U);
-        exit(EXIT_FAILURE);
-    }
-
-    uint32_t mask = set->capacity - 1U;
-    uint32_t index = hash64(key, mask);
-    while (set->keys[index] != 0) {
-        if (set->keys[index] == key) return 1;
-        index = (index + 1U) & mask;
-    }
-
-    set->keys[index] = key;
-    set->size++;
-    return 1;
-}
-
-int keyset_contains(ExpressionKeySet *set, ExpressionKey key) {
-    if (key == 0) return 0;
-
-    uint32_t mask = set->capacity - 1U;
-    uint32_t index = hash64(key, mask);
-    uint32_t start = index;
-
-    while (set->keys[index] != 0) {
-        if (set->keys[index] == key) return 1;
-        index = (index + 1U) & mask;
-        if (index == start) break;
-    }
-    return 0;
-}
-
-void keyset_destroy(ExpressionKeySet *set) {
-    free(set->keys);
-    free(set);
-}
-
-_Atomic(uint_fast32_t) neverendscount = 0;
-_Atomic(uint_fast32_t) neverendsmatch = 0;
-pthread_rwlock_t rwlock = PTHREAD_RWLOCK_INITIALIZER;
-
-void addtoneverends(ExpressionKey expressionkey) {
-    pthread_rwlock_wrlock(&rwlock);
-    keyset_add(neverends, expressionkey);
-    pthread_rwlock_unlock(&rwlock);
-    atomic_fetch_add(&neverendscount, 1);
-}
-
-ExpressionKey cellcontentkey(uint_fast32_t value);
-
-ExpressionKey cells2key(uint_fast32_t tail) {
-    uint_fast32_t cell = next[tail];
-    ExpressionKey expressionkey = cellcontentkey(contents[cell]);
-
-    while (cell != tail) {
-        cell = next[cell];
-        expressionkey = applicationkey(expressionkey,
-                                       cellcontentkey(contents[cell]));
-    }
-    return expressionkey;
-}
-
-ExpressionKey cellcontentkey(uint_fast32_t value) {
-    if (value >= FREEMIN) return cells2key(resolvedtail(value));
-    if (value == 'S') return EXPRESSION_KEY_S;
-    if (value == 'K') return EXPRESSION_KEY_K;
-    if (value == 'x') return EXPRESSION_KEY_X;
-    fprintf(stderr, "cannot canonicalize character value %" PRIuFAST32 "\n", value);
-    exit(EXIT_FAILURE);
-}
-
-ExpressionKey cells2keywithoutfinal(uint_fast32_t tail) {
-    uint_fast32_t cell = next[tail];
-    ExpressionKey expressionkey = cellcontentkey(contents[cell]);
-
-    while (next[cell] != tail) {
-        cell = next[cell];
-        expressionkey = applicationkey(expressionkey,
-                                       cellcontentkey(contents[cell]));
-    }
-    return expressionkey;
-}
-
 typedef struct {
     uint_fast32_t head;
     uint_fast32_t tail;
@@ -2142,8 +1941,7 @@ if (gotx) { \
 }
 
 void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead,
-               uint_fast32_t initlen, ExpressionKey expressionkey,
-               char *buffer, int doprint) {
+               uint_fast32_t initlen, char *buffer, int doprint) {
     uint_fast32_t steps = 0;
     int gotx = 0;
     int repeatsforever = 0;
@@ -2325,7 +2123,7 @@ reductionobserved:
         }
     } else {
         if (repeatsforever) {
-            addtoneverends(expressionkey);
+            (void)atomic_fetch_add(&totalinfinitecount, 1);
             if (repeatsforever == 1) {
                 (void)atomic_fetch_add(&repeatcount, 1);
                 if ((length <= 8) || (length == 13)) {
@@ -2354,7 +2152,7 @@ reductionobserved:
                 }
             }
         } else if (steps >= MAXSTEPS) {
-            addtoneverends(expressionkey);
+            (void)atomic_fetch_add(&totalinfinitecount, 1);
             (void)atomic_fetch_add(&nevercount, 1);
             if (length <= 6) {
                 pthread_mutex_lock(&printlock);
@@ -2413,7 +2211,6 @@ typedef struct {
     int left;
     int right;
     int skbit;
-    unsigned leafcount;
 } NumericNode;
 
 int decodenumericnode(uint_fast32_t num, int_fast32_t *position,
@@ -2430,7 +2227,6 @@ int decodenumericnode(uint_fast32_t num, int_fast32_t *position,
         nodes[currentnode].right = -1;
         nodes[currentnode].skbit =
             (currentleaf == 0) ? -1 : (int)(length - currentleaf);
-        nodes[currentnode].leafcount = 1;
         return (int)currentnode;
     }
 
@@ -2439,9 +2235,6 @@ int decodenumericnode(uint_fast32_t num, int_fast32_t *position,
                                                 leafnum, nodes, nodecount);
     nodes[currentnode].right = decodenumericnode(num, position, length,
                                                  leafnum, nodes, nodecount);
-    nodes[currentnode].leafcount =
-        nodes[nodes[currentnode].left].leafcount +
-        nodes[nodes[currentnode].right].leafcount;
     return (int)currentnode;
 }
 
@@ -2465,59 +2258,6 @@ int decodenumerictree(unsigned length, uint_fast32_t num, NumericNode *nodes) {
 
 unsigned char numericnodesymbol(const NumericNode *node, unsigned count) {
     return ((node->skbit >= 0) && (count & (1U << node->skbit))) ? 'K' : 'S';
-}
-
-ExpressionKey numericnodekey(const NumericNode *nodes, int root,
-                             unsigned count) {
-    if (nodes[root].left < 0) {
-        return (numericnodesymbol(&nodes[root], count) == 'K')
-            ? EXPRESSION_KEY_K : EXPRESSION_KEY_S;
-    }
-    return applicationkey(numericnodekey(nodes, nodes[root].left, count),
-                          numericnodekey(nodes, nodes[root].right, count));
-}
-
-int numericnodekeyandcheck(const NumericNode *nodes, int root, unsigned count,
-                           ExpressionKey *expressionkey) {
-    int arguments[MAXLEN];
-    ExpressionKey prefixkeys[MAXLEN];
-    unsigned argumentcount = 0;
-    unsigned prefixcount = 0;
-    int current = root;
-
-    while (nodes[current].left >= 0) {
-        arguments[argumentcount++] = nodes[current].right;
-        current = nodes[current].left;
-    }
-
-    ExpressionKey prefixkey = numericnodekey(nodes, current, count);
-    unsigned prefixleaves = 1;
-
-    for (unsigned i = argumentcount; i != 0; --i) {
-        if (prefixleaves >= 7) prefixkeys[prefixcount++] = prefixkey;
-        int argument = arguments[i - 1];
-        prefixkey = applicationkey(prefixkey,
-                                   numericnodekey(nodes, argument, count));
-        prefixleaves += nodes[argument].leafcount;
-    }
-    if (prefixleaves >= 7) prefixkeys[prefixcount++] = prefixkey;
-    *expressionkey = prefixkey;
-
-    if (prefixcount == 0) return 0;
-
-    int matched = 0;
-
-    pthread_rwlock_rdlock(&rwlock);
-    for (unsigned i = 0; i < prefixcount; ++i) {
-        if (keyset_contains(neverends, prefixkeys[i])) {
-            matched = 1;
-            break;
-        }
-    }
-    pthread_rwlock_unlock(&rwlock);
-
-    if (matched) atomic_fetch_add(&neverendsmatch, 1);
-    return matched;
 }
 
 int numericnodehasKorSK(const NumericNode *nodes, int root,
@@ -2641,8 +2381,7 @@ uint_fast32_t num2cells(unsigned length, uint_fast32_t num, unsigned count) {
     return xcell;
 }
 
-void dooneSK(unsigned length, uint_fast32_t num, unsigned count,
-             ExpressionKey expressionkey, char *buffer) {
+void dooneSK(unsigned length, uint_fast32_t num, unsigned count, char *buffer) {
     setupfreelist();
     
     uint_fast32_t bufferhead = num2cells(length, num, count);
@@ -2665,7 +2404,7 @@ void dooneSK(unsigned length, uint_fast32_t num, unsigned count,
         return;
     }
 #endif
-    evalcells(length, bufferhead, evalhead, initlen, expressionkey, buffer, 0);
+    evalcells(length, bufferhead, evalhead, initlen, buffer, 0);
 }
 
 #if !SINGLE_THREAD
@@ -2734,8 +2473,6 @@ void dispatchworkbatch(const WorkBatch *batch) {
            batch->length * sizeof(*batch->index));
     memcpy(destination->counts, batch->counts,
            batch->size * sizeof(*batch->counts));
-    memcpy(destination->expressionkeys, batch->expressionkeys,
-           batch->size * sizeof(*batch->expressionkeys));
     (void)atomic_fetch_and(&threadempty, ~mask);
 
     /*
@@ -2774,17 +2511,11 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
     memcpy(batch.index, index, length * sizeof(*index));
 #endif
     for (unsigned count = 0; count < maxcount; ++count) {
-        ExpressionKey expressionkey;
-
-        setSKbuffer(length, count, buffer, index);
-        if (numericnodekeyandcheck(numericnodes, numericroot,
-                                   count, &expressionkey)) {
-            continue;
-        }
         if (numericnodehasKorSK(numericnodes, numericroot,
                                count, 1)) {
             continue;
         }
+        setSKbuffer(length, count, buffer, index);
         if (((atomic_fetch_add(&checked, 1) + 1) % 1000) == 0) {
             pthread_mutex_lock(&printlock);
             printf("\rChecked:%" PRIuFAST32 " %s                                     ",
@@ -2793,10 +2524,9 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
             pthread_mutex_unlock(&printlock);
         }
 #if SINGLE_THREAD
-        dooneSK(length, num, count, expressionkey, buffer);
+        dooneSK(length, num, count, buffer);
 #else
         batch.counts[batch.size] = count;
-        batch.expressionkeys[batch.size] = expressionkey;
         batch.size++;
         if (batch.size == WORK_BATCH_CAPACITY) {
             dispatchworkbatch(&batch);
@@ -2827,7 +2557,6 @@ void *threadrun(void *arg) {
             uint_fast32_t mynum = mybatch->num;
             unsigned mysize = mybatch->size;
             unsigned mycounts[WORK_BATCH_CAPACITY];
-            ExpressionKey myexpressionkeys[WORK_BATCH_CAPACITY];
             char mybuf[MAXBUF + 1];
             int myindex[MAXLEN];
 
@@ -2844,8 +2573,6 @@ void *threadrun(void *arg) {
                    mylen * sizeof(*myindex));
             memcpy(mycounts, mybatch->counts,
                    mysize * sizeof(*mycounts));
-            memcpy(myexpressionkeys, mybatch->expressionkeys,
-                   mysize * sizeof(*myexpressionkeys));
 
             // Everything needed by this worker is now private. Releasing the
             // slot here preserves the old one-slot lookahead while amortizing
@@ -2862,10 +2589,9 @@ void *threadrun(void *arg) {
 
             for (unsigned i = 0; i < mysize; ++i) {
                 unsigned mycount = mycounts[i];
-                ExpressionKey myexpressionkey = myexpressionkeys[i];
 
                 setSKbuffer(mylen, mycount, mybuf, myindex);
-                dooneSK(mylen, mynum, mycount, myexpressionkey, mybuf);
+                dooneSK(mylen, mynum, mycount, mybuf);
             }
             continue;
         }
@@ -3052,21 +2778,12 @@ int main(void) {
 
 #if DOTESTS || DOSEARCH
     char buffer[MAXBUF + 1];
-
-    neverends = keyset_create(NEVERENDS_CAPACITY);
-    if (neverends == NULL) {
-        fprintf(stderr,
-                "failed to allocate never-ending expression set with capacity %u\n",
-                NEVERENDS_CAPACITY);
-        exit(EXIT_FAILURE);
-    }
 #endif
     
 #if DOTESTS
     uint_fast32_t bufferhead;
     uint_fast32_t evalhead;
     uint_fast32_t initlen;
-    ExpressionKey expressionkey;
     
     atomic_store(&maxstep, 0);
     atomic_store(&maxlen, 0);
@@ -3084,7 +2801,6 @@ int main(void) {
     }
 #endif
     initlen = highwatermark - FREEMIN;
-    expressionkey = cells2keywithoutfinal(bufferhead);
 #if 0
     for (uint_fast32_t i = FREEMIN; i < highwatermark; ++i) {
         uint_fast32_t curconts = contents[i];
@@ -3104,7 +2820,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    evalcells(13, bufferhead, evalhead, initlen, expressionkey, buffer, 0);
+    evalcells(13, bufferhead, evalhead, initlen, buffer, 0);
     
     atomic_store(&maxstep, 0);
     atomic_store(&maxlen, 0);
@@ -3122,7 +2838,6 @@ int main(void) {
     }
 #endif
     initlen = highwatermark - FREEMIN;
-    expressionkey = cells2keywithoutfinal(bufferhead);
     evalhead = clonecells(bufferhead);
 #if PARANOID
     if (evalhead == 0) {
@@ -3131,7 +2846,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    evalcells(11, bufferhead, evalhead, initlen, expressionkey, buffer, 0);
+    evalcells(11, bufferhead, evalhead, initlen, buffer, 0);
     
     atomic_store(&maxstep, 0);
     atomic_store(&maxlen, 0);
@@ -3149,7 +2864,6 @@ int main(void) {
     }
 #endif
     initlen = highwatermark - FREEMIN;
-    expressionkey = cells2keywithoutfinal(bufferhead);
     evalhead = clonecells(bufferhead);
 #if PARANOID
     if (evalhead == 0) {
@@ -3158,7 +2872,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    evalcells(2, bufferhead, evalhead, initlen, expressionkey, buffer, 1);
+    evalcells(2, bufferhead, evalhead, initlen, buffer, 1);
     
     fflush(stdout);
 #endif // DOTESTS
@@ -3231,17 +2945,14 @@ int main(void) {
             printf("Repeats forever:%" PRIuFAST32 "", rptcnt);
         }
         putchar('\n');
-        printf("Total infinites:%" PRIuFAST32 " Infinite matches:%" PRIuFAST32 "\n",
-               atomic_load(&neverendscount), atomic_load(&neverendsmatch));
+        printf("Total infinites:%" PRIuFAST32 "\n",
+               atomic_load(&totalinfinitecount));
 #endif // PRINTMAXES
         fflush(stdout);
     }
 #endif // DOSEARCH
 #if !SINGLE_THREAD
     threadfinal();
-#endif
-#if DOTESTS || DOSEARCH
-    keyset_destroy(neverends);
 #endif
     freememopath();
     if (ISATTY(FILENO(stdin))) {

@@ -1589,78 +1589,94 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
     }
 }
 
-int checkforKorSK(char *buffer) {
-    uint_fast32_t position = 0;
-    uint_fast32_t start;
+typedef struct {
+    int left;
+    int right;
+    int skbit;
+} NumericNode;
 
-    // buffer always starts with S
-    if (buffer[1] == 'K') {
-        // buffer starts with SK
-        if (buffer[2] == '(') {
-            // buffer starts with SK([something])
-            position = matchingrightparen(2, buffer);
-            if (buffer[++position] != '\0') {
-                // buffer starts with SK([something])[something else]
-                return 1;
-            }
-            position = 0;
-        } else if (buffer[2] != '\0') {
-            // buffer starts with SKK or SKS or SKx
-            if (buffer[3] != '\0') {
-                // buffer starts with SKK[something] or SKS[something]
-                return 1;
-            }
-        }
+int decodenumericnode(uint_fast32_t num, int_fast32_t *position,
+                      unsigned length, unsigned *leafnum,
+                      NumericNode *nodes, unsigned *nodecount) {
+    unsigned currentnode = (*nodecount)++;
+    int isapplication = (num & ((uint_fast32_t)1 << *position)) != 0;
+
+    *position -= 1;
+    if (!isapplication) {
+        unsigned currentleaf = (*leafnum)++;
+
+        nodes[currentnode].left = -1;
+        nodes[currentnode].right = -1;
+        nodes[currentnode].skbit =
+            (currentleaf == 0) ? -1 : (int)(length - currentleaf);
+        return (int)currentnode;
     }
-    for (;;) {
-        char *kstr = strstr(&buffer[position], "(K");
 
-        if (kstr == NULL) {
-            break;
-        }
-        // got (K
-        start = (uint_fast32_t)(kstr - &buffer[0]) + 2;
-        position = start;
-        // can't be (K)
-        if (buffer[position] == '(') {
-            position = matchingrightparen(position, buffer);
-        }
-        // got (K[something]
-        if (buffer[++position] != ')') {
-            // got (K[something][something else]
+    nodes[currentnode].skbit = -1;
+    nodes[currentnode].left = decodenumericnode(num, position, length,
+                                                leafnum, nodes, nodecount);
+    nodes[currentnode].right = decodenumericnode(num, position, length,
+                                                 leafnum, nodes, nodecount);
+    return (int)currentnode;
+}
+
+int decodenumerictree(unsigned length, uint_fast32_t num, NumericNode *nodes) {
+    int_fast32_t position = (int_fast32_t)(2 * length);
+    unsigned leafnum = 0;
+    unsigned nodecount = 0;
+    int root = decodenumericnode(num, &position, length, &leafnum,
+                                 nodes, &nodecount);
+
+#if PARANOID
+    if ((position != -1) || (leafnum != (length + 1)) ||
+        (nodecount != ((2 * length) + 1))) {
+        printf("*** Programmer error: malformed numeric expression during filtering\n");
+        INT3
+        return -1;
+    }
+#endif
+    return root;
+}
+
+unsigned char numericnodesymbol(const NumericNode *node, unsigned count) {
+    return ((node->skbit >= 0) && (count & (1U << node->skbit))) ? 'K' : 'S';
+}
+
+int numericnodehasKorSK(const NumericNode *nodes, int root,
+                        unsigned count, unsigned extraargs) {
+    int arguments[MAXLEN + 1];
+    unsigned argumentcount = 0;
+    int current = root;
+
+    while (nodes[current].left >= 0) {
+        arguments[argumentcount++] = nodes[current].right;
+        current = nodes[current].left;
+    }
+
+    unsigned totalarguments = argumentcount + extraargs;
+    unsigned char head = numericnodesymbol(&nodes[current], count);
+
+    if ((head == 'K') && (totalarguments >= 2)) {
+        return 1;
+    }
+    if ((head == 'S') && (totalarguments >= 3) && (argumentcount != 0)) {
+        int firstargument = arguments[argumentcount - 1];
+
+        if ((nodes[firstargument].left < 0) &&
+            (numericnodesymbol(&nodes[firstargument], count) == 'K')) {
             return 1;
         }
-        // got (K[something])
-        // resume scan after K
-        position = start;
     }
-    position = 0;
-    for (;;) {
-        char *skstr = strstr(&buffer[position], "(SK");
 
-        if (skstr == NULL) {
-            return 0;
-        }
-        // got (SK
-        start = (uint_fast32_t)(skstr - &buffer[0]) + 3;
-        position = start;
-        // might be (SK)
-        if (buffer[position] == ')') {
-            position += 1;
-            continue;
-        }
-        if (buffer[position] == '(') {
-            position = matchingrightparen(position, buffer);
-        }
-        // got (SK[something]
-        if (buffer[++position] != ')') {
-            // got (SK[something][something else]
+    for (unsigned i = 0; i < argumentcount; ++i) {
+        int argument = arguments[i];
+
+        if ((nodes[argument].left >= 0) &&
+            numericnodehasKorSK(nodes, argument, count, 0)) {
             return 1;
         }
-        // got (SK[something])
-        // resume scan after (SK
-        position = start;
     }
+    return 0;
 }
 
 uint_fast32_t num2cell(uint_fast32_t num, int_fast32_t *position,
@@ -1781,6 +1797,14 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
     size_t bufferlen;
     uint_fast32_t position = 0;
     int skcount = 0;
+    NumericNode numericnodes[(2 * MAXLEN) + 1];
+    int numericroot = decodenumerictree(length, num, numericnodes);
+
+#if PARANOID
+    if (numericroot < 0) {
+        return;
+    }
+#endif
 
     for (int posit = 0; buffer[posit] != '\0'; ++posit) {
         if (buffer[posit] == '?') {
@@ -1823,7 +1847,8 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
                 continue;
             }
         }
-        if (checkforKorSK(buffer)) {
+        if (numericnodehasKorSK(numericnodes, numericroot,
+                               (unsigned)count, 1)) {
             continue;
         }
         if (((atomic_fetch_add(&checked, 1) + 1) % 1000) == 0) {

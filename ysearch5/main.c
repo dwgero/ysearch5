@@ -212,15 +212,11 @@ pthread_mutex_t printlock = PTHREAD_MUTEX_INITIALIZER;
     #define contents cnts[0]
     static uint_fast32_t highwatermark;
     static uint_fast32_t freelist;
-    static uint_fast32_t buflen;
-    static uint_fast32_t peakbuflen;
 #else
     typedef struct {
         int id;
         uint_fast32_t highwatermark_value;
         uint_fast32_t freelist_value;
-        uint_fast32_t buflen_value;
-        uint_fast32_t peakbuflen_value;
     } ThreadAllocatorState;
     PERTHREAD static ThreadAllocatorState allocatorstate;
     #define myid allocatorstate.id
@@ -228,8 +224,6 @@ pthread_mutex_t printlock = PTHREAD_MUTEX_INITIALIZER;
     #define contents cnts[myid]
     #define highwatermark allocatorstate.highwatermark_value
     #define freelist allocatorstate.freelist_value
-    #define buflen allocatorstate.buflen_value
-    #define peakbuflen allocatorstate.peakbuflen_value
 #endif
 
 uint_fast32_t *nxt[MAXTHREADS];
@@ -293,10 +287,10 @@ char threadname[MAXTHREADS][32];
 void setupfreelist(void) {
     highwatermark = FREEMIN;
     freelist = 0;
-    buflen = 0;
-    peakbuflen = 0;
 }
 
+// The high-water mark grows only when the freelist is empty, at which point
+// every earlier arena cell is live. It therefore also records peak live use.
 uint_fast32_t getfree(void) {
     uint_fast32_t temp = freelist;
 
@@ -309,17 +303,12 @@ uint_fast32_t getfree(void) {
         temp = highwatermark++;
     }
 
-    buflen += 1;
-    if (peakbuflen < buflen) {
-        peakbuflen = buflen;
-    }
     return temp;
 }
 
 void putfree(uint_fast32_t cell) {
     next[cell] = freelist;
     freelist = cell;
-    buflen -= 1;
 }
 
 static inline int ismemocontents(uint_fast32_t value) {
@@ -1059,49 +1048,61 @@ static void pushmemopath(MemoPath *path, uint_fast32_t memo,
     insertmemopathmember(path, memo);
 }
 
-static ExpressionCursor startcursor(uint_fast32_t tail,
-                                    const ExpressionCursor *continuation) {
-    ExpressionCursor result = {next[tail], tail, 1, continuation};
-
-    return result;
+static void startcursor(ExpressionCursor *result, uint_fast32_t tail,
+                        const ExpressionCursor *continuation) {
+    result->cell = next[tail];
+    result->tail = tail;
+    result->athead = 1;
+    result->continuation = continuation;
 }
 
-static ExpressionCursor advancecursor(ExpressionCursor cursor) {
-    if (cursor.cell != cursor.tail) {
-        cursor.cell = next[cursor.cell];
-        cursor.athead = 0;
-        return cursor;
+static void advancecursor(ExpressionCursor *cursor) {
+    if (cursor->cell != cursor->tail) {
+        cursor->cell = next[cursor->cell];
+        cursor->athead = 0;
+        return;
     }
-    if (cursor.continuation != NULL) return *cursor.continuation;
-    cursor.cell = 0;
-    cursor.tail = 0;
-    cursor.athead = 0;
-    cursor.continuation = NULL;
-    return cursor;
+    if (cursor->continuation != NULL) {
+        *cursor = *cursor->continuation;
+        return;
+    }
+    cursor->cell = 0;
+    cursor->tail = 0;
+    cursor->athead = 0;
+    cursor->continuation = NULL;
 }
 
 static int equalcursors(ExpressionCursor first, ExpressionCursor second,
                         int toplevel) {
     for (;;) {
         if (first.athead && (contents[first.cell] >= FREEMIN)) {
-            ExpressionCursor continuation = advancecursor(first);
-            ExpressionCursor nested =
-                startcursor(resolvedtail(contents[first.cell]), &continuation);
+            ExpressionCursor continuation = first;
+            ExpressionCursor nested;
+
+            advancecursor(&continuation);
+            startcursor(&nested, resolvedtail(contents[first.cell]),
+                        &continuation);
 
             return equalcursors(nested, second, toplevel);
         }
         if (second.athead && (contents[second.cell] >= FREEMIN)) {
-            ExpressionCursor continuation = advancecursor(second);
-            ExpressionCursor nested =
-                startcursor(resolvedtail(contents[second.cell]), &continuation);
+            ExpressionCursor continuation = second;
+            ExpressionCursor nested;
+
+            advancecursor(&continuation);
+            startcursor(&nested, resolvedtail(contents[second.cell]),
+                        &continuation);
 
             return equalcursors(first, nested, toplevel);
         }
 
         uint_fast32_t value1 = contents[first.cell];
         uint_fast32_t value2 = contents[second.cell];
-        ExpressionCursor nextfirst = advancecursor(first);
-        ExpressionCursor nextsecond = advancecursor(second);
+        ExpressionCursor nextfirst = first;
+        ExpressionCursor nextsecond = second;
+
+        advancecursor(&nextfirst);
+        advancecursor(&nextsecond);
 
         if (!equalcontents(value1, value2)) {
             if (toplevel && (value1 == 'x') && (nextfirst.cell == 0)) {
@@ -1137,17 +1138,23 @@ static int equalcellspath(uint_fast32_t startcells1, uint_fast32_t startcells2,
         ? &path->frames[path->activecontinuation - 1].continuation
         : NULL;
 
-    ExpressionCursor first = startcursor(startcells1, NULL);
-    ExpressionCursor second =
-        startcursor(contents[path->frames[path->depth - 1].memo], continuation);
+    ExpressionCursor first;
+    ExpressionCursor second;
+
+    startcursor(&first, startcells1, NULL);
+    startcursor(&second, contents[path->frames[path->depth - 1].memo],
+                continuation);
 
     return equalcursors(first, second, toplevel);
 }
 
 // startcells1 is always bufferhead if toplevel == 1
 int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int toplevel) {
-    ExpressionCursor first = startcursor(startcells1, NULL);
-    ExpressionCursor second = startcursor(startcells2, NULL);
+    ExpressionCursor first;
+    ExpressionCursor second;
+
+    startcursor(&first, startcells1, NULL);
+    startcursor(&second, startcells2, NULL);
 
 #if PARANOID
     if (first.cell == 0) {
@@ -2285,7 +2292,7 @@ reductionobserved:
         next[tail] = 0;
     }
 
-    uint_fast32_t peakcells = peakbuflen - initlen;
+    uint_fast32_t peakcells = (highwatermark - FREEMIN) - initlen;
 
     RESTOREHEAD
     if (submemo) next[submemo] &= MEMO_MASK;
@@ -2639,7 +2646,7 @@ void dooneSK(unsigned length, uint_fast32_t num, unsigned count,
     }
 #endif
     
-    uint_fast32_t initlen = buflen;
+    uint_fast32_t initlen = highwatermark - FREEMIN;
     uint_fast32_t evalhead = clonecells(bufferhead);
     
 #if PARANOID
@@ -3067,7 +3074,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    initlen = buflen;
+    initlen = highwatermark - FREEMIN;
     expressionkey = cells2keywithoutfinal(bufferhead);
 #if 0
     for (uint_fast32_t i = FREEMIN; i < highwatermark; ++i) {
@@ -3105,7 +3112,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    initlen = buflen;
+    initlen = highwatermark - FREEMIN;
     expressionkey = cells2keywithoutfinal(bufferhead);
     evalhead = clonecells(bufferhead);
 #if PARANOID
@@ -3132,7 +3139,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    initlen = buflen;
+    initlen = highwatermark - FREEMIN;
     expressionkey = cells2keywithoutfinal(bufferhead);
     evalhead = clonecells(bufferhead);
 #if PARANOID

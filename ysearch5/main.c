@@ -815,6 +815,7 @@ typedef struct ExpressionCursor {
 
 typedef struct {
     uint_fast32_t memo;
+    size_t memberslot;
     uint_fast32_t occurrence;
     uint_fast32_t parenttail;
     size_t previouscontinuation;
@@ -871,19 +872,16 @@ static void rehashmemopath(MemoPath *path, size_t newcapacity) {
                 newcapacity);
         exit(EXIT_FAILURE);
     }
-    for (size_t i = 0; i < path->membercapacity; ++i) {
-        MemoPathMember member = path->members[i];
-
-        if ((member.generation != path->generation) ||
-            (member.memo < FREEMIN)) {
-            continue;
-        }
-        size_t index = memopathhash(member.memo, newcapacity);
+    for (size_t i = 0; i < path->depth; ++i) {
+        MemoPathFrame *frame = &path->frames[i];
+        size_t index = memopathhash(frame->memo, newcapacity);
 
         while (newmembers[index].memo != 0) {
             index = (index + 1) & (newcapacity - 1);
         }
-        newmembers[index] = member;
+        newmembers[index].memo = frame->memo;
+        newmembers[index].generation = path->generation;
+        frame->memberslot = index;
     }
     free(path->members);
     path->members = newmembers;
@@ -907,7 +905,7 @@ static int memoinpath(const MemoPath *path, uint_fast32_t memo) {
     }
 }
 
-static void insertmemopathmember(MemoPath *path, uint_fast32_t memo) {
+static size_t insertmemopathmember(MemoPath *path, uint_fast32_t memo) {
     if ((path->membercapacity == 0) ||
         ((path->membercount + path->tombstones + 1) >=
          (path->membercapacity / 2))) {
@@ -951,29 +949,31 @@ static void insertmemopathmember(MemoPath *path, uint_fast32_t memo) {
     path->members[index].memo = memo;
     path->members[index].generation = path->generation;
     path->membercount++;
+    return index;
 }
 
-static void removememopathmember(MemoPath *path, uint_fast32_t memo) {
-    size_t index = memopathhash(memo, path->membercapacity);
-
-    for (;;) {
-        MemoPathMember *member = &path->members[index];
+static void removememopathmember(MemoPath *path,
+                                 const MemoPathFrame *frame) {
+#if PARANOID
+    if (frame->memberslot >= path->membercapacity) {
+        printf("*** Programmer error: memo update path slot is invalid\n");
+        INT3
+        return;
+    }
+#endif
+    MemoPathMember *member = &path->members[frame->memberslot];
 
 #if PARANOID
-        if ((member->generation != path->generation) || (member->memo == 0)) {
-            printf("*** Programmer error: memo update path member is missing\n");
-            INT3
-            return;
-        }
-#endif
-        if (member->memo == memo) {
-            member->memo = 1;
-            path->membercount--;
-            path->tombstones++;
-            return;
-        }
-        index = (index + 1) & (path->membercapacity - 1);
+    if ((member->generation != path->generation) ||
+        (member->memo != frame->memo)) {
+        printf("*** Programmer error: memo update path member is missing\n");
+        INT3
+        return;
     }
+#endif
+    member->memo = 1;
+    path->membercount--;
+    path->tombstones++;
 }
 
 static void clearmemopath(MemoPath *path) {
@@ -994,7 +994,7 @@ static void clearmemopath(MemoPath *path) {
 static void truncatememopath(MemoPath *path, size_t newdepth) {
     while (path->depth > newdepth) {
         path->depth--;
-        removememopathmember(path, path->frames[path->depth].memo);
+        removememopathmember(path, &path->frames[path->depth]);
     }
     path->activecontinuation =
         newdepth ? path->frames[newdepth - 1].activecontinuation : 0;
@@ -1044,8 +1044,8 @@ static void pushmemopath(MemoPath *path, uint_fast32_t memo,
         path->activecontinuation = path->depth + 1;
     }
     frame->activecontinuation = path->activecontinuation;
+    frame->memberslot = insertmemopathmember(path, memo);
     path->depth++;
-    insertmemopathmember(path, memo);
 }
 
 static void startcursor(ExpressionCursor *result, uint_fast32_t tail,

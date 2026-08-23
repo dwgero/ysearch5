@@ -244,6 +244,7 @@ char workbuf[MAXTHREADS][MAXBUF + 1];
 unsigned worklen[MAXTHREADS];
 uint_fast32_t worknum[MAXTHREADS];
 unsigned workcount[MAXTHREADS];
+uint32_t workexpressionid[MAXTHREADS];
 char threadname[MAXTHREADS][32];
 #endif
 
@@ -792,35 +793,47 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
 }
 
 #define INITIAL_CAPACITY 100000 // 50% load factor for 50k items
+#define INITIAL_INTERN_CAPACITY 131072
+#define ID_S 1U
+#define ID_K 2U
+#define ID_X 3U
 
 typedef struct {
-    char **keys;
+    uint32_t *keys;
     uint32_t capacity;
     uint32_t size;
-} HashSet;
+} IdSet;
 
-uint32_t fnv1a_hash(const char *str, uint32_t capacity) {
-    uint32_t hash = 2166136261U;
-    while (*str) {
-        hash ^= (uint8_t)*str++;
-        hash *= 16777619U;
-    }
-    return hash % capacity;
+typedef struct {
+    uint64_t *keys;
+    uint32_t *ids;
+    uint32_t capacity;
+    uint32_t size;
+    uint32_t nextid;
+} ApplicationInterner;
+
+uint32_t hash64(uint64_t value, uint32_t capacity) {
+    value ^= value >> 33;
+    value *= UINT64_C(0xff51afd7ed558ccd);
+    value ^= value >> 33;
+    value *= UINT64_C(0xc4ceb9fe1a85ec53);
+    value ^= value >> 33;
+    return (uint32_t)(value % capacity);
 }
 
-HashSet *set_create(uint32_t capacity) {
-    HashSet *set = malloc(sizeof(HashSet));
+IdSet *set_create(uint32_t capacity) {
+    IdSet *set = malloc(sizeof(IdSet));
     if (!set) return NULL;
-    set->keys = calloc(capacity, sizeof(char*));
+    set->keys = calloc(capacity, sizeof(*set->keys));
     if (!set->keys) { free(set); return NULL; }
     set->capacity = capacity;
     set->size = 0;
     return set;
 }
 
-HashSet *neverends;
+IdSet *neverends;
 
-int set_add(HashSet *set, const char *key) {
+int set_add(IdSet *set, uint32_t key) {
     if (set->size >= set->capacity / 2) {
         fprintf(stderr,
                 "never-ending expression set reached its maximum size of %" PRIu32 " entries\n",
@@ -828,101 +841,164 @@ int set_add(HashSet *set, const char *key) {
         exit(EXIT_FAILURE);
     }
 
-    uint32_t index = fnv1a_hash(key, set->capacity);
-    while (set->keys[index] != NULL) {
-        if (strcmp(set->keys[index], key) == 0) return 1; // Already exists
+    uint32_t index = hash64(key, set->capacity);
+    while (set->keys[index] != 0) {
+        if (set->keys[index] == key) return 1; // Already exists
         index = (index + 1) % set->capacity;
     }
 
-    set->keys[index] = strdup(key);
-    if (set->keys[index] == NULL) {
-        fprintf(stderr, "strdup failed while adding to never-ending expression set\n");
-        exit(EXIT_FAILURE);
-    }
+    set->keys[index] = key;
     set->size++;
     return 1;
 }
 
-int set_contains(HashSet *set, const char *key) {
-    uint32_t index = fnv1a_hash(key, set->capacity);
+int set_contains(IdSet *set, uint32_t key) {
+    uint32_t index = hash64(key, set->capacity);
     uint32_t start = index;
 
-    while (set->keys[index] != NULL) {
-        if (strcmp(set->keys[index], key) == 0) return 1;
+    while (set->keys[index] != 0) {
+        if (set->keys[index] == key) return 1;
         index = (index + 1) % set->capacity;
         if (index == start) break;
     }
     return 0;
 }
 
-void set_destroy(HashSet *set) {
-    for (uint32_t i = 0; i < set->capacity; i++) {
-        if (set->keys[i]) free(set->keys[i]);
-    }
+void set_destroy(IdSet *set) {
     free(set->keys);
     free(set);
 }
+
+ApplicationInterner *interner_create(uint32_t capacity) {
+    ApplicationInterner *interner = malloc(sizeof(*interner));
+    if (interner == NULL) return NULL;
+    interner->keys = calloc(capacity, sizeof(*interner->keys));
+    interner->ids = calloc(capacity, sizeof(*interner->ids));
+    if ((interner->keys == NULL) || (interner->ids == NULL)) {
+        free(interner->keys);
+        free(interner->ids);
+        free(interner);
+        return NULL;
+    }
+    interner->capacity = capacity;
+    interner->size = 0;
+    interner->nextid = ID_X + 1;
+    return interner;
+}
+
+void interner_resize(ApplicationInterner *interner) {
+    if (interner->capacity > (UINT32_MAX / 2)) {
+        fprintf(stderr, "canonical expression table is too large\n");
+        exit(EXIT_FAILURE);
+    }
+    uint32_t newcapacity = interner->capacity * 2;
+    uint64_t *newkeys = calloc(newcapacity, sizeof(*newkeys));
+    uint32_t *newids = calloc(newcapacity, sizeof(*newids));
+
+    if ((newkeys == NULL) || (newids == NULL)) {
+        free(newkeys);
+        free(newids);
+        fprintf(stderr,
+                "failed to grow canonical expression table to capacity %" PRIu32 "\n",
+                newcapacity);
+        exit(EXIT_FAILURE);
+    }
+    for (uint32_t i = 0; i < interner->capacity; ++i) {
+        if (interner->keys[i] != 0) {
+            uint32_t index = hash64(interner->keys[i], newcapacity);
+
+            while (newkeys[index] != 0) {
+                index = (index + 1) % newcapacity;
+            }
+            newkeys[index] = interner->keys[i];
+            newids[index] = interner->ids[i];
+        }
+    }
+    free(interner->keys);
+    free(interner->ids);
+    interner->keys = newkeys;
+    interner->ids = newids;
+    interner->capacity = newcapacity;
+}
+
+uint32_t internapplication(ApplicationInterner *interner,
+                           uint32_t left, uint32_t right) {
+    if (interner->size >= (interner->capacity - (interner->capacity / 4))) {
+        interner_resize(interner);
+    }
+    uint64_t key = ((uint64_t)left << 32) | right;
+    uint32_t index = hash64(key, interner->capacity);
+
+    while (interner->keys[index] != 0) {
+        if (interner->keys[index] == key) {
+            return interner->ids[index];
+        }
+        index = (index + 1) % interner->capacity;
+    }
+    if (interner->nextid == 0) {
+        fprintf(stderr, "canonical expression ID space exhausted\n");
+        exit(EXIT_FAILURE);
+    }
+    uint32_t id = interner->nextid++;
+
+    interner->keys[index] = key;
+    interner->ids[index] = id;
+    interner->size++;
+    return id;
+}
+
+void interner_destroy(ApplicationInterner *interner) {
+    free(interner->keys);
+    free(interner->ids);
+    free(interner);
+}
+
+ApplicationInterner *expressions;
 
 _Atomic(uint_fast32_t) neverendscount = 0;
 _Atomic(uint_fast32_t) neverendsmatch = 0;
 pthread_rwlock_t rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
-void addtoneverends(char *buffer) {
-    size_t bufferlen;
-    char last;
-    
-    bufferlen = strlen(buffer);
-    last = buffer[--bufferlen];
-    buffer[bufferlen] = '\0';
+void addtoneverends(uint32_t expressionid) {
     pthread_rwlock_wrlock(&rwlock);
-    set_add(neverends, buffer);
+    set_add(neverends, expressionid);
     pthread_rwlock_unlock(&rwlock);
-    buffer[bufferlen] = last;
     atomic_fetch_add(&neverendscount, 1);
 }
 
-uint_fast32_t matchingrightparen(uint_fast32_t position, char *buffer) {
-    uint_fast32_t parencount = 1;
-    
-    for (;;) {
-        char curchar = buffer[++position];
-        
-        if (curchar == ')') {
-            if (--parencount == 0) {
-                return position;
-            }
-        } else if (curchar == '(') {
-            parencount += 1;
-        } else if (curchar == '\0') {
-            printf("*** Programmer error: missing right paren\n");
-            INT3
-            return position;
-        }
+uint32_t cellcontentid(uint_fast32_t value);
+
+uint32_t cells2id(uint_fast32_t tail) {
+    uint_fast32_t cell = next[tail];
+    uint32_t expressionid = cellcontentid(contents[cell]);
+
+    while (cell != tail) {
+        cell = next[cell];
+        expressionid = internapplication(expressions, expressionid,
+                                         cellcontentid(contents[cell]));
     }
+    return expressionid;
 }
 
-int checkforneverends(size_t bufferlen, char *buffer, uint_fast32_t position) {
-    int result = 0;
-    char last;
-    
-    pthread_rwlock_rdlock(&rwlock);
-    do {
-        last = buffer[position];
-        buffer[position] = '\0';
-        if (set_contains(neverends, buffer)) {
-            buffer[position] = last;
-            result = 1;
-            atomic_fetch_add(&neverendsmatch, 1);
-            break;
-        }
-        buffer[position] = last;
-        if (last == '(') {
-            position = matchingrightparen(position, buffer);
-        }
-        position += 1;
-    } while (position < bufferlen);
-    pthread_rwlock_unlock(&rwlock);
-    return result;
+uint32_t cellcontentid(uint_fast32_t value) {
+    if (value >= FREEMIN) return cells2id(value);
+    if (value == 'S') return ID_S;
+    if (value == 'K') return ID_K;
+    if (value == 'x') return ID_X;
+    fprintf(stderr, "cannot canonicalize character value %" PRIuFAST32 "\n", value);
+    exit(EXIT_FAILURE);
+}
+
+uint32_t cells2idwithoutfinal(uint_fast32_t tail) {
+    uint_fast32_t cell = next[tail];
+    uint32_t expressionid = cellcontentid(contents[cell]);
+
+    while (next[cell] != tail) {
+        cell = next[cell];
+        expressionid = internapplication(expressions, expressionid,
+                                         cellcontentid(contents[cell]));
+    }
+    return expressionid;
 }
 
 #define RESTOREHEAD \
@@ -936,7 +1012,8 @@ if (gotx) { \
 }
 
 void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead,
-               uint_fast32_t initlen, char *buffer, int doprint) {
+               uint_fast32_t initlen, uint32_t expressionid,
+               char *buffer, int doprint) {
     uint_fast32_t steps = 0;
     int gotx = 0;
     int repeatsforever = 0;
@@ -1505,7 +1582,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
         }
     } else {
         if (repeatsforever) {
-            addtoneverends(buffer);
+            addtoneverends(expressionid);
             if (repeatsforever == 1) {
                 (void)atomic_fetch_add(&repeatcount, 1);
                 if ((length <= 8) || (length == 13)) {
@@ -1534,7 +1611,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
                 }
             }
         } else if (steps >= MAXSTEPS) {
-            addtoneverends(buffer);
+            addtoneverends(expressionid);
             (void)atomic_fetch_add(&nevercount, 1);
             if (length <= 6) {
                 pthread_mutex_lock(&printlock);
@@ -1593,6 +1670,7 @@ typedef struct {
     int left;
     int right;
     int skbit;
+    unsigned leafcount;
 } NumericNode;
 
 int decodenumericnode(uint_fast32_t num, int_fast32_t *position,
@@ -1609,6 +1687,7 @@ int decodenumericnode(uint_fast32_t num, int_fast32_t *position,
         nodes[currentnode].right = -1;
         nodes[currentnode].skbit =
             (currentleaf == 0) ? -1 : (int)(length - currentleaf);
+        nodes[currentnode].leafcount = 1;
         return (int)currentnode;
     }
 
@@ -1617,6 +1696,9 @@ int decodenumericnode(uint_fast32_t num, int_fast32_t *position,
                                                 leafnum, nodes, nodecount);
     nodes[currentnode].right = decodenumericnode(num, position, length,
                                                  leafnum, nodes, nodecount);
+    nodes[currentnode].leafcount =
+        nodes[nodes[currentnode].left].leafcount +
+        nodes[nodes[currentnode].right].leafcount;
     return (int)currentnode;
 }
 
@@ -1640,6 +1722,58 @@ int decodenumerictree(unsigned length, uint_fast32_t num, NumericNode *nodes) {
 
 unsigned char numericnodesymbol(const NumericNode *node, unsigned count) {
     return ((node->skbit >= 0) && (count & (1U << node->skbit))) ? 'K' : 'S';
+}
+
+uint32_t numericnodeid(const NumericNode *nodes, int root, unsigned count) {
+    if (nodes[root].left < 0) {
+        return (numericnodesymbol(&nodes[root], count) == 'K') ? ID_K : ID_S;
+    }
+    return internapplication(expressions,
+                             numericnodeid(nodes, nodes[root].left, count),
+                             numericnodeid(nodes, nodes[root].right, count));
+}
+
+int numericnodeidandcheck(const NumericNode *nodes, int root, unsigned count,
+                          uint32_t *expressionid) {
+    int arguments[MAXLEN + 1];
+    uint32_t prefixids[MAXLEN + 1];
+    unsigned argumentcount = 0;
+    unsigned prefixcount = 0;
+    int current = root;
+
+    while (nodes[current].left >= 0) {
+        arguments[argumentcount++] = nodes[current].right;
+        current = nodes[current].left;
+    }
+
+    uint32_t prefixid = numericnodeid(nodes, current, count);
+    unsigned prefixleaves = 1;
+
+    for (unsigned i = argumentcount; i != 0; --i) {
+        if (prefixleaves >= 7) prefixids[prefixcount++] = prefixid;
+        int argument = arguments[i - 1];
+        prefixid = internapplication(expressions, prefixid,
+                                     numericnodeid(nodes, argument, count));
+        prefixleaves += nodes[argument].leafcount;
+    }
+    if (prefixleaves >= 7) prefixids[prefixcount++] = prefixid;
+    *expressionid = prefixid;
+
+    if (prefixcount == 0) return 0;
+
+    int matched = 0;
+
+    pthread_rwlock_rdlock(&rwlock);
+    for (unsigned i = 0; i < prefixcount; ++i) {
+        if (set_contains(neverends, prefixids[i])) {
+            matched = 1;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&rwlock);
+
+    if (matched) atomic_fetch_add(&neverendsmatch, 1);
+    return matched;
 }
 
 int numericnodehasKorSK(const NumericNode *nodes, int root,
@@ -1763,7 +1897,8 @@ uint_fast32_t num2cells(unsigned length, uint_fast32_t num, unsigned count) {
     return xcell;
 }
 
-void dooneSK(unsigned length, uint_fast32_t num, unsigned count, char *buffer) {
+void dooneSK(unsigned length, uint_fast32_t num, unsigned count,
+             uint32_t expressionid, char *buffer) {
     setupfreelist();
     
     uint_fast32_t bufferhead = num2cells(length, num, count);
@@ -1786,7 +1921,7 @@ void dooneSK(unsigned length, uint_fast32_t num, unsigned count, char *buffer) {
         return;
     }
 #endif
-    evalcells(length, bufferhead, evalhead, initlen, buffer, 0);
+    evalcells(length, bufferhead, evalhead, initlen, expressionid, buffer, 0);
 }
 
 void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
@@ -1794,9 +1929,6 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
     int indexnum = (int)length;
     int maxcount = 1 << length;
     int count;
-    size_t bufferlen;
-    uint_fast32_t position = 0;
-    int skcount = 0;
     NumericNode numericnodes[(2 * MAXLEN) + 1];
     int numericroot = decodenumerictree(length, num, numericnodes);
 
@@ -1813,39 +1945,15 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
     }
     buffer[0] = 'S';
     strncat(buffer, "x", MAXBUF);
-    bufferlen = strlen(buffer);
-    {
-        size_t bufflen = bufferlen;
-        uint_fast32_t rightparen;
-        
-        // back up from 'x' at end
-        // back up one more if not ')'
-        if (buffer[--bufflen] != ')') {
-            bufflen -= 1;
-        }
-        while ((position < bufflen) && (skcount < 7)) {
-            if (buffer[position] == '(') {
-                rightparen = matchingrightparen(position, buffer);
-                while (++position < rightparen) {
-                    if ((buffer[position] != '(') &&
-                        (buffer[position] != ')')) {
-                        skcount += 1;
-                    }
-                }
-            } else {
-                skcount += 1;
-            }
-            position += 1;
-        }
-    }
     for (count = 0; count < maxcount; ++count) {
+        uint32_t expressionid;
+
         for (unsigned i = 0; i < length; ++i) {
             buffer[index[i]] = (count & (1 << i)) ? 'K' : 'S';
         }
-        if ((skcount >= 7) && (position < bufferlen)) {
-            if (checkforneverends(bufferlen, buffer, position)) {
-                continue;
-            }
+        if (numericnodeidandcheck(numericnodes, numericroot,
+                                  (unsigned)count, &expressionid)) {
+            continue;
         }
         if (numericnodehasKorSK(numericnodes, numericroot,
                                (unsigned)count, 1)) {
@@ -1859,7 +1967,7 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
             pthread_mutex_unlock(&printlock);
         }
 #if SINGLE_THREAD
-        dooneSK(length, num, (unsigned)count, buffer);
+        dooneSK(length, num, (unsigned)count, expressionid, buffer);
 #else
         uint64_t thmt = atomic_load(&threadempty);
         unsigned threadnum;
@@ -1917,6 +2025,7 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
         worklen[threadnum] = length;
         worknum[threadnum] = num;
         workcount[threadnum] = (unsigned)count;
+        workexpressionid[threadnum] = expressionid;
         (void)atomic_fetch_and(&threadempty, ~mask);
         
         /*
@@ -1951,6 +2060,7 @@ void *threadrun(void *arg) {
             unsigned mylen = worklen[mythreadnum];
             uint_fast32_t mynum = worknum[mythreadnum];
             unsigned mycount = workcount[mythreadnum];
+            uint32_t myexpressionid = workexpressionid[mythreadnum];
             char mybuf[MAXBUF+1];
             
             strcpy(mybuf, workbuf[mythreadnum]);
@@ -1963,7 +2073,7 @@ void *threadrun(void *arg) {
                     exit(EXIT_FAILURE);
                 }
             }
-            dooneSK(mylen, mynum, mycount, mybuf);
+            dooneSK(mylen, mynum, mycount, myexpressionid, mybuf);
             continue;
         }
         (void)atomic_fetch_or(&threadwaiting, mask);
@@ -2156,12 +2266,21 @@ int main(void) {
                 INITIAL_CAPACITY);
         exit(EXIT_FAILURE);
     }
+    expressions = interner_create(INITIAL_INTERN_CAPACITY);
+    if (expressions == NULL) {
+        fprintf(stderr,
+                "failed to allocate canonical expression table with capacity %u\n",
+                INITIAL_INTERN_CAPACITY);
+        set_destroy(neverends);
+        exit(EXIT_FAILURE);
+    }
 #endif
     
 #if DOTESTS
     uint_fast32_t bufferhead;
     uint_fast32_t evalhead;
     uint_fast32_t initlen;
+    uint32_t expressionid;
     
     atomic_store(&maxstep, 0);
     atomic_store(&maxlen, 0);
@@ -2179,6 +2298,7 @@ int main(void) {
     }
 #endif
     initlen = buflen;
+    expressionid = cells2idwithoutfinal(bufferhead);
 #if 0
     for (uint_fast32_t i = FREEMIN; i < highwatermark; ++i) {
         uint_fast32_t curconts = contents[i];
@@ -2198,7 +2318,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    evalcells(13, bufferhead, evalhead, initlen, buffer, 0);
+    evalcells(13, bufferhead, evalhead, initlen, expressionid, buffer, 0);
     
     atomic_store(&maxstep, 0);
     atomic_store(&maxlen, 0);
@@ -2216,6 +2336,7 @@ int main(void) {
     }
 #endif
     initlen = buflen;
+    expressionid = cells2idwithoutfinal(bufferhead);
     evalhead = clonecells(bufferhead);
 #if PARANOID
     if (evalhead == 0) {
@@ -2224,7 +2345,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    evalcells(11, bufferhead, evalhead, initlen, buffer, 0);
+    evalcells(11, bufferhead, evalhead, initlen, expressionid, buffer, 0);
     
     atomic_store(&maxstep, 0);
     atomic_store(&maxlen, 0);
@@ -2242,6 +2363,7 @@ int main(void) {
     }
 #endif
     initlen = buflen;
+    expressionid = cells2idwithoutfinal(bufferhead);
     evalhead = clonecells(bufferhead);
 #if PARANOID
     if (evalhead == 0) {
@@ -2250,7 +2372,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 #endif
-    evalcells(2, bufferhead, evalhead, initlen, buffer, 1);
+    evalcells(2, bufferhead, evalhead, initlen, expressionid, buffer, 1);
     
     fflush(stdout);
 #endif // DOTESTS
@@ -2337,6 +2459,7 @@ int main(void) {
 #endif
 #if DOTESTS || DOSEARCH
     set_destroy(neverends);
+    interner_destroy(expressions);
 #endif
     if (ISATTY(FILENO(stdin))) {
         puts("\nPress any key to exit");

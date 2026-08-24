@@ -74,6 +74,13 @@
 #ifndef PRINTMAXES
 #define PRINTMAXES 1
 #endif
+#ifndef HAS_INFINITE_H
+#define HAS_INFINITE_H 1
+#endif
+
+#if HAS_INFINITE_H
+#include "infinite.h"
+#endif
 
 #if SINGLE_THREAD
     #define MAXTHREADS 1
@@ -212,8 +219,11 @@ _Atomic(uint_fast32_t) maxlenstep;
 char bufmaxlen[MAXBUF + 1];
 
 pthread_mutex_t printlock = PTHREAD_MUTEX_INITIALIZER;
+
+#if !HAS_INFINITE_H
 pthread_mutex_t infinitefilelock = PTHREAD_MUTEX_INITIALIZER;
 FILE *infinitefile;
+#endif
 char *infinitepath;
 
 // Allocator state changes on every cell allocation/free. Keep it private to
@@ -262,7 +272,9 @@ typedef struct {
 } PackedKeySet;
 
 static PackedKeySet neverendingset;
+#if !HAS_INFINITE_H
 static void loadinfinitecatalog(FILE *file);
+#endif
 static void destroypackedkeyset(PackedKeySet *set);
 
 _Atomic(uint_fast32_t) repeatcount = 0;
@@ -299,6 +311,7 @@ WorkBatch workbatch[MAXTHREADS];
 char threadname[MAXTHREADS][32];
 #endif
 
+#if !HAS_INFINITE_H
 static char *getexecutablepath(const char *argv0)
 {
     (void)argv0;
@@ -503,6 +516,7 @@ static int closeinfinitefile(void)
     infinitepath = NULL;
     return result;
 }
+#endif
 
 // things that can return 0:
 // next[]
@@ -519,22 +533,24 @@ void setupfreelist(void) {
 
 // The high-water mark grows only when the freelist is empty, at which point
 // every earlier arena cell is live. It therefore also records peak live use.
-uint_fast32_t getfree(void) {
+static inline uint_fast32_t getfree(void) {
     uint_fast32_t temp = freelist;
 
     if (temp) {
         freelist = next[temp];
     } else {
+#if PARANOID
         if (highwatermark >= maxstr) {
             return 0;
         }
+#endif
         temp = highwatermark++;
     }
 
     return temp;
 }
 
-void putfree(uint_fast32_t cell) {
+static inline void putfree(uint_fast32_t cell) {
     next[cell] = freelist;
     freelist = cell;
 }
@@ -729,7 +745,7 @@ int_fast32_t num2str(uint_fast32_t num, int_fast32_t position, char *buffer, uin
     }
     if (num & (1 << position--)) {
         uint_fast32_t dontparen = first + (num & (1 << (position + 2)));
-        
+
         if (dontparen == 0) {
             strncat(buffer, "(", MAXBUF);
         }
@@ -776,7 +792,7 @@ void setSKbuffer(unsigned length, unsigned count, char *buffer,
 uint_fast32_t str2cell(int nested, char *buffer, uint_fast32_t *str2cellspos) {
     uint_fast32_t head = 0;
     uint_fast32_t tail = 0;
-    
+
 #if !PARANOID
     (void)nested;
 #endif
@@ -854,11 +870,13 @@ uint_fast32_t str2cell(int nested, char *buffer, uint_fast32_t *str2cellspos) {
     }
 }
 
-uint_fast32_t str2cells(char *buffer) {
+#if DOTESTS
+static inline uint_fast32_t str2cells(char *buffer) {
     uint_fast32_t str2cellspos = 0;
-    
+
     return str2cell(0, buffer, &str2cellspos);
 }
+#endif
 
 void printcells(uint_fast32_t startcell) {
     uint_fast32_t tail = startcell;
@@ -897,12 +915,13 @@ void printcells(uint_fast32_t startcell) {
     }
 }
 
-void putcells(uint_fast32_t cells) {
+static inline void putcells(uint_fast32_t cells) {
     printcells(cells);
     putchar('\n');
 }
 
-void putcontents(uint_fast32_t conts) {
+#if 0
+static inline void putcontents(uint_fast32_t conts) {
     if (conts < FREEMIN) {
         putchar((unsigned char)conts);
         putchar('\n');
@@ -910,6 +929,7 @@ void putcontents(uint_fast32_t conts) {
     }
     putcells(resolvedtail(conts));
 }
+#endif
 
 // cells2str unused
 # if 0
@@ -953,7 +973,7 @@ void cell2str(uint_fast32_t startcell) {
     }
 }
 
-void cells2str(uint_fast32_t cells) {
+static inline void cells2str(uint_fast32_t cells) {
     cells2strpos = 0;
     cell2str(cells);
     strbuf[cells2strpos] = '\0';
@@ -1592,6 +1612,7 @@ static void destroypackedkeyset(PackedKeySet *set) {
     set->size = 0;
 }
 
+#if !HAS_INFINITE_H
 _Noreturn static void invalidcatalogline(size_t linenumber,
                                          const char *message) {
     fprintf(stderr, "invalid %s line %zu: %s\n",
@@ -1717,6 +1738,16 @@ static void loadinfinitecatalog(FILE *file) {
         (void)packedkeysetinsert(&neverendingset, recordedkey);
     }
 }
+#else
+static void readinfiniteh(void) {
+    infinitepath = "infinite.h";
+    initializepackedkeyset(&neverendingset);
+
+    for (size_t i = 0; i < INFINITE_KEY_COUNT; ++i) {
+        (void)packedkeysetinsert(&neverendingset, infinite_keys[i]);
+    }
+}
+#endif
 
 static PackedKey cellcontentpackedkey(uint_fast32_t value);
 
@@ -1741,6 +1772,7 @@ static PackedKey cellcontentpackedkey(uint_fast32_t value) {
     exit(EXIT_FAILURE);
 }
 
+#if !HAS_INFINITE_H
 static PackedKey cells2packedkeywithoutfinal(uint_fast32_t tail) {
     uint_fast32_t cell = next[tail];
     PackedKey key = cellcontentpackedkey(contents[cell]);
@@ -1783,6 +1815,7 @@ static void writeinfinitecombinator(uint_fast32_t bufferhead,
     }
     pthread_mutex_unlock(&infinitefilelock);
 }
+#endif
 
 typedef struct {
     uint_fast32_t head;
@@ -2713,7 +2746,9 @@ reductionobserved:
         }
     } else {
         if (repeatsforever) {
+#if !HAS_INFINITE_H
             writeinfinitecombinator(bufferhead, buffer);
+#endif
             (void)atomic_fetch_add(&totalinfinitecount, 1);
             if (repeatsforever == 1) {
                 (void)atomic_fetch_add(&repeatcount, 1);
@@ -2743,7 +2778,9 @@ reductionobserved:
                 }
             }
         } else if (steps >= MAXSTEPS) {
+#if !HAS_INFINITE_H
             writeinfinitecombinator(bufferhead, buffer);
+#endif
             (void)atomic_fetch_add(&totalinfinitecount, 1);
             (void)atomic_fetch_add(&nevercount, 1);
             if (length <= 6) {
@@ -3371,7 +3408,13 @@ void threadfinal(void) {
 
 int main(int argc, char **argv) {
     (void)argc;
+#if HAS_INFINITE_H
+    (void)argv;
+
+    readinfiniteh();
+#else
     openinfinitefile(argv[0]);
+#endif
 
 #if SINGLE_THREAD
     nxt[0] = malloc(MAXARRAY * sizeof(uint_fast32_t));
@@ -3574,7 +3617,13 @@ int main(int argc, char **argv) {
 #if !SINGLE_THREAD
     threadfinal();
 #endif
+#if HAS_INFINITE_H
+    int result = EXIT_SUCCESS;
+
+    destroypackedkeyset(&neverendingset);
+#else
     int result = closeinfinitefile();
+#endif
 
     freememopath();
     if ((result == EXIT_SUCCESS) && ISATTY(FILENO(stdin))) {

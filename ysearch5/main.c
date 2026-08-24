@@ -5,6 +5,9 @@
 //  Copyright (C) 2026 by David W. Gero.  All Rights Reserved.
 //
 
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <string.h>
@@ -82,17 +85,14 @@
 #include "infinite.h"
 #endif
 
-#if SINGLE_THREAD
-    #define MAXTHREADS 1
-#else
-    // maximum 64, suggested is (number of hardware CPUs - 1)
-    #define MAXTHREADS 15
-#endif
+#define MAXTHREADALLOC 64
+_Static_assert(MAXTHREADALLOC >= 1 && MAXTHREADALLOC <= 64,
+               "MAXTHREADALLOC must be between 1 and 64");
 
-_Static_assert(MAXTHREADS >= 1 && MAXTHREADS <= 64,
-               "MAXTHREADS must be between 1 and 64");
-#define ALL_THREADS_MASK \
-    (UINT64_MAX >> (64 - MAXTHREADS))
+#if !SINGLE_THREAD
+    static int maxthreads;
+    static uint64_t allthreadsmask;
+#endif
 
 #if defined(__clang__)
     #define DEBUG_TRAP() __builtin_debugtrap()
@@ -248,8 +248,8 @@ char *infinitepath;
     #define freelist allocatorstate.freelist_value
 #endif
 
-uint_fast32_t *nxt[MAXTHREADS];
-uint_fast32_t *cnts[MAXTHREADS];
+uint_fast32_t *nxt[MAXTHREADALLOC];
+uint_fast32_t *cnts[MAXTHREADALLOC];
 // An expression pointer identifies its tail cell; next[tail] identifies its
 // head cell, making the expression a circular ring. If contents < FREEMIN,
 // it is a character. An untagged larger value identifies the tail of an owned
@@ -266,7 +266,11 @@ _Static_assert((uint_fast32_t)MAXARRAY < MEMO_BIT,
 typedef uint64_t PackedKey;
 
 typedef struct {
+#if HAS_INFINITE_H
+    const PackedKey *keys;
+#else
     PackedKey *keys;
+#endif
     size_t capacity;
     size_t size;
 } PackedKeySet;
@@ -274,8 +278,8 @@ typedef struct {
 static PackedKeySet neverendingset;
 #if !HAS_INFINITE_H
 static void loadinfinitecatalog(FILE *file);
-#endif
 static void destroypackedkeyset(PackedKeySet *set);
+#endif
 
 _Atomic(uint_fast32_t) repeatcount = 0;
 _Atomic(uint_fast32_t) nevercount = 0;
@@ -300,15 +304,49 @@ typedef struct {
     unsigned counts[WORK_BATCH_CAPACITY];
 } WorkBatch;
 
-pthread_t thread[MAXTHREADS];
-sem_t *threadsem[MAXTHREADS];
+pthread_t thread[MAXTHREADALLOC];
+sem_t *threadsem[MAXTHREADALLOC];
 sem_t *mastersem;
-_Atomic(uint64_t) threadempty = ALL_THREADS_MASK;
+_Atomic(uint64_t) threadempty = 0;
 _Atomic(uint64_t) threadwaiting = 0;
 atomic_int exiting = 0;
 atomic_int masterwaiting = 0;
-WorkBatch workbatch[MAXTHREADS];
-char threadname[MAXTHREADS][32];
+WorkBatch workbatch[MAXTHREADALLOC];
+char threadname[MAXTHREADALLOC][32];
+
+static void setmaxthreads(void) {
+    uint64_t cpucount;
+
+#if defined(_WIN32) || defined(_WIN64)
+    SYSTEM_INFO systeminfo;
+
+    GetSystemInfo(&systeminfo);
+    cpucount = (uint64_t)systeminfo.dwNumberOfProcessors;
+    if (cpucount == 0) {
+        fprintf(stderr, "GetSystemInfo reported no processors\n");
+        exit(EXIT_FAILURE);
+    }
+#else
+    errno = 0;
+    long detectedcpus = sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (detectedcpus < 1) {
+        int error = errno ? errno : EIO;
+
+        fprintf(stderr, "sysconf(_SC_NPROCESSORS_ONLN) failed: %s\n",
+                strerror(error));
+        exit(EXIT_FAILURE);
+    }
+    cpucount = (uint64_t)detectedcpus;
+#endif
+
+    uint64_t workercount = (cpucount > 1U) ? (cpucount - 1U) : 1U;
+
+    if (workercount > MAXTHREADALLOC) workercount = MAXTHREADALLOC;
+    maxthreads = (int)workercount;
+    allthreadsmask = UINT64_MAX >> (64U - (unsigned)maxthreads);
+    atomic_store(&threadempty, allthreadsmask);
+}
 #endif
 
 #if !HAS_INFINITE_H
@@ -1512,11 +1550,6 @@ static inline PackedKey packedapplicationkey(PackedKey left,
     return ((PackedKey)resultbits << PACKED_KEY_LENGTH_SHIFT) | payload;
 }
 
-#define INITIAL_PACKED_KEY_CAPACITY 1024U
-_Static_assert((INITIAL_PACKED_KEY_CAPACITY &
-                (INITIAL_PACKED_KEY_CAPACITY - 1U)) == 0,
-               "initial packed-key capacity must be a power of two");
-
 static inline size_t packedkeyhash(PackedKey key, size_t mask) {
     key ^= key >> 33;
     key *= UINT64_C(0xff51afd7ed558ccd);
@@ -1525,6 +1558,12 @@ static inline size_t packedkeyhash(PackedKey key, size_t mask) {
     key ^= key >> 33;
     return (size_t)key & mask;
 }
+
+#if !HAS_INFINITE_H
+#define INITIAL_PACKED_KEY_CAPACITY 1048576U
+_Static_assert((INITIAL_PACKED_KEY_CAPACITY &
+                (INITIAL_PACKED_KEY_CAPACITY - 1U)) == 0,
+               "initial packed-key capacity must be a power of two");
 
 static void initializepackedkeyset(PackedKeySet *set) {
     set->keys = calloc(INITIAL_PACKED_KEY_CAPACITY,
@@ -1590,6 +1629,7 @@ static int packedkeysetinsert(PackedKeySet *set, PackedKey key) {
     set->size++;
     return 1;
 }
+#endif
 
 static int packedkeysetcontains(const PackedKeySet *set, PackedKey key) {
     if ((set->keys == NULL) || (key == 0)) return 0;
@@ -1605,6 +1645,7 @@ static int packedkeysetcontains(const PackedKeySet *set, PackedKey key) {
     return 0;
 }
 
+#if !HAS_INFINITE_H
 static void destroypackedkeyset(PackedKeySet *set) {
     free(set->keys);
     set->keys = NULL;
@@ -1612,7 +1653,6 @@ static void destroypackedkeyset(PackedKeySet *set) {
     set->size = 0;
 }
 
-#if !HAS_INFINITE_H
 _Noreturn static void invalidcatalogline(size_t linenumber,
                                          const char *message) {
     fprintf(stderr, "invalid %s line %zu: %s\n",
@@ -1739,13 +1779,17 @@ static void loadinfinitecatalog(FILE *file) {
     }
 }
 #else
+_Static_assert(INFINITE_KEY_CAPACITY != 0U &&
+               (INFINITE_KEY_CAPACITY & (INFINITE_KEY_CAPACITY - 1U)) == 0U,
+               "embedded infinite-key capacity must be a power of two");
+_Static_assert(INFINITE_KEY_COUNT <= (INFINITE_KEY_CAPACITY / 2U),
+               "embedded infinite-key table must be at most half full");
+
 static void readinfiniteh(void) {
     infinitepath = "infinite.h";
-    initializepackedkeyset(&neverendingset);
-
-    for (size_t i = 0; i < INFINITE_KEY_COUNT; ++i) {
-        (void)packedkeysetinsert(&neverendingset, infinite_keys[i]);
-    }
+    neverendingset.keys = infinite_keys;
+    neverendingset.capacity = INFINITE_KEY_CAPACITY;
+    neverendingset.size = INFINITE_KEY_COUNT;
 }
 #endif
 
@@ -3094,9 +3138,9 @@ void dispatchworkbatch(const WorkBatch *batch) {
     unsigned threadnum = ctz64(thmt);
 
 #if PARANOID
-    if (threadnum >= MAXTHREADS) {
-        fprintf(stderr, "*** Programmer error: threadnum == %u >= MAXTHREADS == %d\n",
-                threadnum, MAXTHREADS);
+    if (threadnum >= (unsigned)maxthreads) {
+        fprintf(stderr, "*** Programmer error: threadnum == %u >= maxthreads == %d\n",
+                threadnum, maxthreads);
         INT3
         exit(EXIT_FAILURE);
     }
@@ -3314,7 +3358,7 @@ void threadinit(void) {
     while ((sem_trywait(mastersem) == 0) || (errno == EINTR)) {
         // nothing to do, keep going
     }
-    for (int i = 0; i < MAXTHREADS; ++i) {
+    for (int i = 0; i < maxthreads; ++i) {
         snprintf(threadname[i], sizeof(threadname[i]), "/threadsem%02d", i);
         threadsem[i] = sem_open(threadname[i], O_CREAT, (S_IRUSR | S_IWUSR), 0);
         if (threadsem[i] == SEM_FAILED) {
@@ -3373,7 +3417,7 @@ void threadfinal(void) {
         perror(NULL);
         INT3
     }
-    for (int i = 0; i < MAXTHREADS; ++i) {
+    for (int i = 0; i < maxthreads; ++i) {
         if (sem_post(threadsem[i]) != 0) {
             fprintf(stderr, "sem_post on threadsem[%02d] failed: ", i);
             perror(NULL);
@@ -3396,7 +3440,7 @@ void threadfinal(void) {
         perror(NULL);
         INT3
     }
-    for (int i = 0; i < MAXTHREADS; ++i) {
+    for (int i = 0; i < maxthreads; ++i) {
         if (sem_close(threadsem[i]) != 0) {
             fprintf(stderr, "sem_close of %s failed: ", threadname[i]);
             perror(NULL);
@@ -3408,6 +3452,9 @@ void threadfinal(void) {
 
 int main(int argc, char **argv) {
     (void)argc;
+#if !SINGLE_THREAD
+    setmaxthreads();
+#endif
 #if HAS_INFINITE_H
     (void)argv;
 
@@ -3571,11 +3618,11 @@ int main(int argc, char **argv) {
 #if !SINGLE_THREAD
         // wait for all threads to finish
         // check threadempty first to make sure no thread is still working
-        while (atomic_load(&threadempty) != ALL_THREADS_MASK) {
+        while (atomic_load(&threadempty) != allthreadsmask) {
             sched_yield();
         }
         // then make sure all threads are waiting
-        while (atomic_load(&threadwaiting) != ALL_THREADS_MASK) {
+        while (atomic_load(&threadwaiting) != allthreadsmask) {
             sched_yield();
         }
 #endif
@@ -3603,7 +3650,7 @@ int main(int argc, char **argv) {
             printf("Repeats forever:%" PRIuFAST32 "", rptcnt);
         }
         putchar('\n');
-        printf("Total infinites:%" PRIuFAST32,
+        printf("Total new infinites:%" PRIuFAST32,
                atomic_load(&totalinfinitecount));
         if (neverendingset.keys != NULL) {
             printf(" Infinite matches:%" PRIuFAST32,
@@ -3619,8 +3666,6 @@ int main(int argc, char **argv) {
 #endif
 #if HAS_INFINITE_H
     int result = EXIT_SUCCESS;
-
-    destroypackedkeyset(&neverendingset);
 #else
     int result = closeinfinitefile();
 #endif

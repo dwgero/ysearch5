@@ -39,6 +39,10 @@
 #define PACKED_KEY_S PACKED_LEAF_KEY(PACKED_TOKEN_S)
 #define PACKED_KEY_K PACKED_LEAF_KEY(PACKED_TOKEN_K)
 #define CATALOG_LINE_CAPACITY 128U
+#define INFINITE_KEY_CAPACITY 1048576U
+
+_Static_assert((INFINITE_KEY_CAPACITY & (INFINITE_KEY_CAPACITY - 1U)) == 0,
+               "infinite-key capacity must be a power of two");
 
 typedef struct {
     uint64_t *keys;
@@ -390,8 +394,45 @@ static void sortanddeduplicate(KeyArray *array)
     array->count = unique;
 }
 
+static size_t packedkeyhash(uint64_t key, size_t mask)
+{
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    key ^= key >> 33;
+    key *= UINT64_C(0xc4ceb9fe1a85ec53);
+    key ^= key >> 33;
+    return (size_t)key & mask;
+}
+
+static uint64_t *buildtable(const KeyArray *array)
+{
+    if (array->count > (INFINITE_KEY_CAPACITY / 2U)) {
+        fprintf(stderr,
+                "infinite.cmb contains %zu unique keys; the %u-slot table "
+                "holds at most %u\n",
+                array->count, INFINITE_KEY_CAPACITY,
+                INFINITE_KEY_CAPACITY / 2U);
+        exit(EXIT_FAILURE);
+    }
+    uint64_t *table = calloc(INFINITE_KEY_CAPACITY, sizeof(*table));
+
+    if (table == NULL) fatal("failed to allocate infinite-key hash table");
+    size_t mask = INFINITE_KEY_CAPACITY - 1U;
+
+    for (size_t i = 0; i < array->count; ++i) {
+        uint64_t key = array->keys[i];
+        size_t index = packedkeyhash(key, mask);
+
+        while (table[index] != 0) {
+            index = (index + 1U) & mask;
+        }
+        table[index] = key;
+    }
+    return table;
+}
+
 static void writeheader(const char *outputpath, const char *temppath,
-                        const KeyArray *array)
+                        const KeyArray *array, const uint64_t *table)
 {
     errno = 0;
     FILE *output = fopen(temppath, "w");
@@ -403,13 +444,16 @@ static void writeheader(const char *outputpath, const char *temppath,
         "#ifndef __INFINITE_H_\n"
         "#define __INFINITE_H_\n\n"
         "#include <stdint.h>\n\n"
+        "#define INFINITE_KEY_CAPACITY %uU\n"
         "#define INFINITE_KEY_COUNT %zuU\n\n"
-        "static const uint64_t infinite_keys[INFINITE_KEY_COUNT] = {\n",
-        array->count) < 0;
+        "static const uint64_t infinite_keys[INFINITE_KEY_CAPACITY] = {\n",
+        INFINITE_KEY_CAPACITY, array->count) < 0;
 
-    for (size_t i = 0; (i < array->count) && !failed; ++i) {
-        failed = fprintf(output, "    UINT64_C(0x%016" PRIx64 "),\n",
-                         array->keys[i]) < 0;
+    for (size_t i = 0; (i < INFINITE_KEY_CAPACITY) && !failed; ++i) {
+        if (table[i] == 0) continue;
+        failed = fprintf(output,
+                         "    [%zu] = UINT64_C(0x%016" PRIx64 "),\n",
+                         i, table[i]) < 0;
     }
     if (!failed) {
         failed = fprintf(output,
@@ -461,8 +505,12 @@ int main(int argc, char **argv)
     KeyArray keys = readkeys(inputpath);
 
     sortanddeduplicate(&keys);
-    writeheader(outputpath, temppath, &keys);
-    printf("wrote %zu packed keys to %s\n", keys.count, outputpath);
+    uint64_t *table = buildtable(&keys);
+
+    writeheader(outputpath, temppath, &keys, table);
+    printf("wrote %zu packed keys in %u slots to %s\n",
+           keys.count, INFINITE_KEY_CAPACITY, outputpath);
+    free(table);
     free(keys.keys);
     free(temppath);
     free(outputpath);

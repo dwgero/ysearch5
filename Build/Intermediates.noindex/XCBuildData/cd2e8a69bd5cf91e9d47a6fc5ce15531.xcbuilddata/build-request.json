@@ -1,0 +1,59 @@
+{
+  "buildCommand" : {
+    "command" : "build",
+    "skipDependencies" : false,
+    "style" : "buildAndRun"
+  },
+  "configuredTargets" : [
+    {
+      "guid" : "0a2b4480653a0243fa0ad48302bae315a79c661eeeac4f9a95c1311f7e65a55d"
+    }
+  ],
+  "containerPath" : "/Users/david/Developer/ysearch5/ysearch5/ysearch5.xcodeproj",
+  "continueBuildingAfterErrors" : false,
+  "dependencyScope" : "workspace",
+  "enableIndexBuildArena" : false,
+  "hideShellScriptEnvironment" : false,
+  "parameters" : {
+    "action" : "build",
+    "activeArchitecture" : "arm64",
+    "activeRunDestination" : {
+      "disableOnlyActiveArch" : false,
+      "hostTargetedPlatform" : null,
+      "platform" : "macosx",
+      "sdk" : "macosx26.5",
+      "sdkVariant" : "macos",
+      "supportedArchitectures" : [
+        "arm64e",
+        "arm64",
+        "x86_64"
+      ],
+      "targetArchitecture" : "arm64"
+    },
+    "arenaInfo" : {
+      "buildIntermediatesPath" : "/Users/david/Developer/ysearch5/ysearch5/Build/Intermediates.noindex",
+      "buildProductsPath" : "/Users/david/Developer/ysearch5/ysearch5/Build/Products",
+      "derivedDataPath" : "/Users/david/Developer/ysearch5/ysearch5/DerivedData",
+      "indexDataStoreFolderPath" : "/Users/david/Developer/ysearch5/ysearch5/DerivedData/ysearch5/Index.noindex/DataStore",
+      "indexEnableDataStore" : true,
+      "indexPCHPath" : "/Users/david/Developer/ysearch5/ysearch5/DerivedData/ysearch5/Index.noindex/PrecompiledHeaders",
+      "pchPath" : "/Users/david/Developer/ysearch5/ysearch5/Build/Intermediates.noindex/PrecompiledHeaders"
+    },
+    "configurationName" : "Debug",
+    "overrides" : {
+      "synthesized" : {
+        "table" : {
+          "ENABLE_PREVIEWS" : "NO",
+          "ENABLE_XOJIT_PREVIEWS" : "YES",
+          "ONLY_ACTIVE_ARCH" : "YES"
+        }
+      }
+    }
+  },
+  "schemeCommand" : "launch",
+  "showNonLoggedProgress" : true,
+  "useDryRun" : false,
+  "useImplicitDependencies" : true,
+  "useLegacyBuildLocations" : false,
+  "useParallelTargets" : true
+}

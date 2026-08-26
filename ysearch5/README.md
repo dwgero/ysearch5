@@ -91,11 +91,11 @@ xcrun clang \
   -std=c11 -O3 -march=native -DNDEBUG \
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror \
   -pthread -DHAS_INFINITE_H=0 \
-  main.c -o build/ysearch5
+  main.c -o build/ysearch5-noh
 ```
 ### 3. Run the uncached search
 ```sh
-./build/ysearch5
+./build/ysearch5-noh
 ```
 Because no catalogue exists, the program creates `build/infinite.cmb` and
 writes each newly classified divergent combinator as:
@@ -141,11 +141,11 @@ xcrun clang \
   -std=c11 -O3 -march=native -DNDEBUG \
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror \
   -pthread -DHAS_INFINITE_H=1 -Ibuild \
-  main.c -o build/ysearch5-embedded
+  main.c -o build/ysearch5
 ```
 Run the embedded version with:
 ```sh
-./build/ysearch5-embedded
+./build/ysearch5
 ```
 ## File-backed reuse without generating a header
 

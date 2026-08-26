@@ -21,15 +21,26 @@ parentheses, and the appended `x` do not count. The search enumerates every
 supported binary application-tree shape from one through `MAXLEN` (== 12) leaves,
 fixes the leftmost leaf to S, and assigns S or K to every remaining leaf. It
 skips candidates for which `P x` already contains a reducible `K a b` or
-`S K a b` form. Evaluation uses weak-head reduction with call-by-need sharing
-for the argument duplicated by S.
+`S K a b` form. Evaluation uses strong leftmost-outermost graph reduction.
+After the outer expression reaches weak-head form, reduction continues through
+its arguments from left to right, including arguments of underapplied `S` or
+`K` and of the opaque variable `x`. An argument duplicated by `S` is shared
+call-by-need rather than copied and reduced independently.
 
-Candidates are classified as terminating, structurally repeating, otherwise
-recurring, or out of the configured step/cell resources. Resource exhaustion
-is operationally classified as `Never ends`; it is not a proof of mathematical
-divergence. Divergent and resource-exhausted candidates can be recorded in
-`infinite.cmb`. Catalogue matches are exact whole-expression matches; they are
-not prefix matches.
+A candidate is accepted immediately when the complete term is `x Q` and `Q`
+equals the original `P x`. A winner is not normalized further: doing so would
+force the very recurrence that the program has just established.
+
+Otherwise, a candidate terminates only when no reachable S/K redex remains.
+`Repeats forever` means the complete expression returned exactly to its
+initial `P x` state. Memo cycles and configured step/cell exhaustion are
+reported as `Never ends`; other cycles need not be recognized before reaching
+a resource limit. Resource exhaustion is an operational classification, not a
+proof of mathematical divergence.
+
+Divergent and resource-exhausted candidates can be recorded in `infinite.cmb`.
+Catalogue lookups are exact complete-expression matches, never prefix or
+nested-subexpression matches.
 
 ## Requirements
 
@@ -99,6 +110,11 @@ run is interrupted or crashes, move or remove the partial
 `build/infinite.cmb` before restarting an uncached search; a truncated final
 record is intentionally rejected.
 
+Catalogues are specific to the evaluator semantics and configured resource
+ceilings; the file format does not carry a version or those limits. To
+generate a complete current catalogue, start the file-backed executable
+with no `infinite.cmb` beside it.
+
 ### 4. Compile the header generator
 
 Place the generator executable beside the completed catalogue:
@@ -113,7 +129,7 @@ xcrun clang \
 ./build/makeinfh
 ```
 `makeinfh` validates every packed key against its readable expression, sorts
-and deduplicates the keys, constructs the final 1,048,576-slot hash table, and
+and deduplicates the keys, constructs the final 2,097,152-slot hash table, and
 writes `build/infinite.h`.
 
 ### 6. Compile the embedded-catalogue search
@@ -148,3 +164,9 @@ limits, and step limits are compile-time constants near the top of `main.c`.
 
 `ysearch5` is distributed under the GNU General Public License, version 3 or
 later. See `LICENSE`.
+
+Copyright (C) 2026 by David W. Gero
+
+This `README.md` file is licensed under Creative Commons Attribution-ShareAlike
+4.0 International. To view a copy of this license, visit
+<https://creativecommons.org/licenses/by-sa/4.0/>.

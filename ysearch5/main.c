@@ -215,6 +215,7 @@ _Static_assert(MAXLEN <= (sizeof(maxstrtable) / sizeof(maxstrtable[0])),
                "MAXLEN exceeds maxstrtable capacity");
 _Static_assert(MAXLEN <= (sizeof(maxsteptable) / sizeof(maxsteptable[0])),
                "MAXLEN exceeds maxsteptable capacity");
+_Static_assert(MAXLEN >= 1, "MAXLEN must include at least one leaf");
 _Static_assert(MAXSTRTABLE_11 < MAXARRAY,
                "maxstrtable[11] must be less than MAXARRAY");
 
@@ -268,14 +269,17 @@ uint_fast32_t *cnts[MAXTHREADALLOC];
 // it is a character. An untagged larger value identifies the tail of an owned
 // subexpression. A value with MEMO_BIT set identifies a memo cell: the memo
 // cell's contents points to the shared subexpression tail and its next holds
-// the reference count (plus a transient evaluator busy flag).
+// the reference count, a transient evaluator busy flag, and a stable flag
+// once strong traversal has proved the shared target fully reduced.
 #define FREEMIN 256
 #define MEMO_BIT (UINT_FAST32_MAX - (UINT_FAST32_MAX >> 1))
 #define MEMO_MASK (MEMO_BIT - 1)
+#define MEMO_NORMAL_BIT (MEMO_BIT >> 1)
+#define MEMO_REFERENCE_MASK (MEMO_NORMAL_BIT - 1)
 _Static_assert((MEMO_BIT & (MEMO_BIT - 1)) == 0,
                "MEMO_BIT must be the highest value bit");
-_Static_assert((uint_fast32_t)MAXARRAY < MEMO_BIT,
-               "arena indices must fit below MEMO_BIT");
+_Static_assert((uint_fast32_t)MAXARRAY < MEMO_NORMAL_BIT,
+               "arena indices and memo references must fit below memo flags");
 typedef uint64_t PackedKey;
 
 typedef struct {
@@ -656,7 +660,7 @@ static inline uint_fast32_t resolvedtail(uint_fast32_t value) {
 }
 
 static inline uint_fast32_t memoreferences(uint_fast32_t memo) {
-    return next[memo] & MEMO_MASK;
+    return next[memo] & MEMO_REFERENCE_MASK;
 }
 
 void memoacquire(uint_fast32_t value) {
@@ -665,8 +669,9 @@ void memoacquire(uint_fast32_t value) {
 
 #if PARANOID
     if (!ismemocontents(value) || (memo < FREEMIN) ||
-        (memo >= highwatermark) || ((state & MEMO_MASK) == 0) ||
-        ((state & MEMO_MASK) == MEMO_MASK)) {
+        (memo >= highwatermark) ||
+        ((state & MEMO_REFERENCE_MASK) == 0) ||
+        ((state & MEMO_REFERENCE_MASK) == MEMO_REFERENCE_MASK)) {
         printf("*** Programmer error: invalid memo acquire at %" PRIuFAST32 "\n",
                memo);
         INT3
@@ -687,7 +692,7 @@ void releasecontents(uint_fast32_t value) {
 
     uint_fast32_t memo = memocell(value);
     uint_fast32_t state = next[memo];
-    uint_fast32_t references = state & MEMO_MASK;
+    uint_fast32_t references = state & MEMO_REFERENCE_MASK;
 
 #if PARANOID
     if ((memo < FREEMIN) || (memo >= highwatermark) || (references == 0)) {
@@ -999,12 +1004,12 @@ void printcells(uint_fast32_t startcell) {
     }
 }
 
+#if 0
 static inline void putcells(uint_fast32_t cells) {
     printcells(cells);
     putchar('\n');
 }
 
-#if 0
 static inline void putcontents(uint_fast32_t conts) {
     if (conts < FREEMIN) {
         putchar((unsigned char)conts);
@@ -1124,23 +1129,6 @@ uint_fast32_t clonecontents(uint_fast32_t conts) {
     return clonecells(conts);
 }
 
-int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int toplevel);
-
-static int equalcontents(uint_fast32_t value1, uint_fast32_t value2) {
-    if ((value1 < FREEMIN) || (value2 < FREEMIN)) {
-        return value1 == value2;
-    }
-    if (ismemocontents(value1) && (value1 == value2)) return 1;
-    return equalcells(resolvedtail(value1), resolvedtail(value2), 0) != 0;
-}
-
-typedef struct ExpressionCursor {
-    uint_fast32_t cell;
-    uint_fast32_t tail;
-    int athead;
-    const struct ExpressionCursor *continuation;
-} ExpressionCursor;
-
 // Reduction may move a direct subexpression or memo tag into the first cell of
 // a ring. Canonical observers flatten that leading span, so it denotes the same
 // left-associated application as the former character-headed representation.
@@ -1150,9 +1138,6 @@ typedef struct {
     size_t memberslot;
     uint_fast32_t occurrence;
     uint_fast32_t parenttail;
-    size_t previouscontinuation;
-    size_t activecontinuation;
-    ExpressionCursor continuation;
 } MemoPathFrame;
 
 typedef struct {
@@ -1164,7 +1149,6 @@ typedef struct {
     MemoPathFrame *frames;
     size_t depth;
     size_t capacity;
-    size_t activecontinuation;
     MemoPathMember *members;
     size_t membercapacity;
     size_t membercount;
@@ -1172,20 +1156,61 @@ typedef struct {
     uint32_t generation;
 } MemoPath;
 
-PERTHREAD static MemoPath evaluatorpath;
+enum NormalOwnerKind {
+    NORMAL_ROOT,
+    NORMAL_DIRECT,
+    NORMAL_MEMO
+};
 
-static void freememopath(void) {
-    free(evaluatorpath.frames);
-    free(evaluatorpath.members);
-    evaluatorpath.frames = NULL;
-    evaluatorpath.members = NULL;
-    evaluatorpath.depth = 0;
-    evaluatorpath.capacity = 0;
-    evaluatorpath.activecontinuation = 0;
-    evaluatorpath.membercapacity = 0;
-    evaluatorpath.membercount = 0;
-    evaluatorpath.tombstones = 0;
-    evaluatorpath.generation = 0;
+enum NormalFramePhase {
+    NORMAL_AT_ROOT,
+    NORMAL_SCANNING_ARGUMENTS
+};
+
+typedef struct {
+    enum NormalOwnerKind kind;
+    enum NormalFramePhase phase;
+    uint_fast32_t owner;
+    uint_fast32_t head;
+    uint_fast32_t tail;
+    uint_fast32_t cursor;
+} NormalFrame;
+
+typedef struct {
+    NormalFrame *frames;
+    size_t depth;
+    size_t capacity;
+} NormalTraversal;
+
+typedef struct {
+    uint_fast32_t cell;
+    uint_fast32_t tail;
+    size_t applications;
+} ExpressionTokenFrame;
+
+typedef struct {
+    ExpressionTokenFrame *frames;
+    size_t depth;
+    size_t capacity;
+    size_t applicationsleft;
+} ExpressionTokenTraversal;
+
+typedef struct {
+    MemoPath memopath;
+    NormalTraversal normal;
+    ExpressionTokenTraversal comparison;
+} EvaluatorState;
+
+PERTHREAD static EvaluatorState evaluatorstate;
+
+static void freeevaluatorpaths(void) {
+    EvaluatorState *state = &evaluatorstate;
+
+    free(state->memopath.frames);
+    free(state->memopath.members);
+    free(state->normal.frames);
+    free(state->comparison.frames);
+    memset(state, 0, sizeof(*state));
 }
 
 static size_t memopathhash(uint_fast32_t memo, size_t capacity) {
@@ -1310,7 +1335,6 @@ static void removememopathmember(MemoPath *path,
 
 static void clearmemopath(MemoPath *path) {
     path->depth = 0;
-    path->activecontinuation = 0;
     path->membercount = 0;
     path->tombstones = 0;
     path->generation++;
@@ -1328,8 +1352,6 @@ static void truncatememopath(MemoPath *path, size_t newdepth) {
         path->depth--;
         removememopathmember(path, &path->frames[path->depth]);
     }
-    path->activecontinuation =
-        newdepth ? path->frames[newdepth - 1].activecontinuation : 0;
 }
 
 static void pushmemopath(MemoPath *path, uint_fast32_t memo,
@@ -1353,179 +1375,85 @@ static void pushmemopath(MemoPath *path, uint_fast32_t memo,
         }
         path->frames = newframes;
         path->capacity = newcapacity;
-        for (size_t i = 0; i < path->depth; ++i) {
-            size_t previous = path->frames[i].previouscontinuation;
-
-            path->frames[i].continuation.continuation =
-                previous ? &path->frames[previous - 1].continuation : NULL;
-        }
     }
     MemoPathFrame *frame = &path->frames[path->depth];
 
     frame->memo = memo;
     frame->occurrence = occurrence;
     frame->parenttail = parenttail;
-    frame->previouscontinuation = path->activecontinuation;
-    if (occurrence != parenttail) {
-        frame->continuation.cell = next[occurrence];
-        frame->continuation.tail = parenttail;
-        frame->continuation.athead = 0;
-        frame->continuation.continuation = frame->previouscontinuation
-            ? &path->frames[frame->previouscontinuation - 1].continuation
-            : NULL;
-        path->activecontinuation = path->depth + 1;
-    }
-    frame->activecontinuation = path->activecontinuation;
     frame->memberslot = insertmemopathmember(path, memo);
     path->depth++;
 }
 
-static void startcursor(ExpressionCursor *result, uint_fast32_t tail,
-                        const ExpressionCursor *continuation) {
-    result->cell = next[tail];
-    result->tail = tail;
-    result->athead = 1;
-    result->continuation = continuation;
-}
+static int pushtokenframe(ExpressionTokenTraversal *traversal,
+                          uint_fast32_t tail) {
+    if (traversal->depth == traversal->capacity) {
+        size_t newcapacity = traversal->capacity
+            ? (traversal->capacity * 2) : 64;
 
-static void advancecursor(ExpressionCursor *cursor) {
-    if (cursor->cell != cursor->tail) {
-        cursor->cell = next[cursor->cell];
-        cursor->athead = 0;
-        return;
-    }
-    if (cursor->continuation != NULL) {
-        *cursor = *cursor->continuation;
-        return;
-    }
-    cursor->cell = 0;
-    cursor->tail = 0;
-    cursor->athead = 0;
-    cursor->continuation = NULL;
-}
-
-static int equalcursors(ExpressionCursor first, ExpressionCursor second,
-                        int toplevel) {
-    for (;;) {
-        if (first.athead && (contents[first.cell] >= FREEMIN)) {
-            ExpressionCursor continuation = first;
-            ExpressionCursor nested;
-
-            advancecursor(&continuation);
-            startcursor(&nested, resolvedtail(contents[first.cell]),
-                        &continuation);
-
-            return equalcursors(nested, second, toplevel);
+        if ((newcapacity < traversal->capacity) ||
+            (newcapacity > (SIZE_MAX / sizeof(*traversal->frames)))) {
+            fprintf(stderr, "expression comparison is too deep\n");
+            exit(EXIT_FAILURE);
         }
-        if (second.athead && (contents[second.cell] >= FREEMIN)) {
-            ExpressionCursor continuation = second;
-            ExpressionCursor nested;
+        ExpressionTokenFrame *newframes =
+            realloc(traversal->frames, newcapacity * sizeof(*newframes));
 
-            advancecursor(&continuation);
-            startcursor(&nested, resolvedtail(contents[second.cell]),
-                        &continuation);
-
-            return equalcursors(first, nested, toplevel);
+        if (newframes == NULL) {
+            fprintf(stderr,
+                    "failed to grow expression comparison to %zu frames\n",
+                    newcapacity);
+            exit(EXIT_FAILURE);
         }
+        traversal->frames = newframes;
+        traversal->capacity = newcapacity;
+    }
+    ExpressionTokenFrame *frame = &traversal->frames[traversal->depth++];
 
-        uint_fast32_t value1 = contents[first.cell];
-        uint_fast32_t value2 = contents[second.cell];
-        ExpressionCursor nextfirst = first;
-        ExpressionCursor nextsecond = second;
-
-        advancecursor(&nextfirst);
-        advancecursor(&nextsecond);
-
-        if (!equalcontents(value1, value2)) {
-            if (toplevel && (value1 == 'x') && (nextfirst.cell == 0)) {
-                return 2;
-            }
+    frame->cell = next[tail];
+    frame->tail = tail;
+    frame->applications = 0;
+    for (uint_fast32_t cell = frame->cell; cell != tail; cell = next[cell]) {
+        if (frame->applications == traversal->applicationsleft) {
+            traversal->depth--;
             return 0;
         }
-        if (nextfirst.cell == 0) {
-            if (nextsecond.cell == 0) return 1;
-            return toplevel ? 2 : 0;
-        }
-        if (nextsecond.cell == 0) return 0;
-        first = nextfirst;
-        second = nextsecond;
+        frame->applications++;
     }
+    traversal->applicationsleft -= frame->applications;
+    return 1;
 }
 
-static int equalcellspath(uint_fast32_t startcells1, uint_fast32_t startcells2,
-                          int toplevel, MemoPath *path) {
-    if (path->depth == 0) {
-        return equalcells(startcells1, startcells2, toplevel);
-    }
+// Emit a preorder token stream for the exact application tree. Applications
+// use token zero; S, K, and x retain their character values. An explicit heap
+// stack avoids consuming the fixed worker stack on deeply nested results.
+static int nextexpressiontoken(ExpressionTokenTraversal *traversal,
+                               uint_fast32_t *token) {
+    while (traversal->depth != 0) {
+        ExpressionTokenFrame *frame =
+            &traversal->frames[traversal->depth - 1];
 
-#if PARANOID
-    if (path->frames[0].parenttail != startcells2) {
-        printf("*** Programmer error: memo path has wrong parent tail\n");
-        INT3
-        return 0;
-    }
-#endif
-
-    const ExpressionCursor *continuation = path->activecontinuation
-        ? &path->frames[path->activecontinuation - 1].continuation
-        : NULL;
-
-    ExpressionCursor first;
-    ExpressionCursor second;
-
-    startcursor(&first, startcells1, NULL);
-    startcursor(&second, contents[path->frames[path->depth - 1].memo],
-                continuation);
-
-    return equalcursors(first, second, toplevel);
-}
-
-// startcells1 is always bufferhead if toplevel == 1
-int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int toplevel) {
-    ExpressionCursor first;
-    ExpressionCursor second;
-
-    startcursor(&first, startcells1, NULL);
-    startcursor(&second, startcells2, NULL);
-
-#if PARANOID
-    if (first.cell == 0) {
-        printf("*** Programmer error: unexpected end of first comparison at %" PRIuFAST32 "\n", startcells1);
-        INT3
-        return 0;
-    }
-    if (second.cell == 0) {
-        printf("*** Programmer error: unexpected end of second comparison at %" PRIuFAST32 "\n", startcells2);
-        INT3
-        return 0;
-    }
-#endif
-    if ((contents[first.cell] >= FREEMIN) ||
-        (contents[second.cell] >= FREEMIN)) {
-        return equalcursors(first, second, toplevel);
-    }
-
-    uint_fast32_t cell1 = first.cell;
-    uint_fast32_t cell2 = second.cell;
-
-    for (;;) {
-        uint_fast32_t value1 = contents[cell1];
-        uint_fast32_t value2 = contents[cell2];
-
-        if (!equalcontents(value1, value2)) {
-            if (toplevel && (value1 == 'x') && (cell1 == startcells1)) {
-                return 2;
-            }
-            return 0;
+        if (frame->applications != 0) {
+            frame->applications--;
+            *token = 0;
+            return 1;
         }
-        if (cell1 == startcells1) {
-            if (cell2 == startcells2) return 1;
-            return toplevel ? 2 : 0;
+
+        uint_fast32_t value = contents[frame->cell];
+
+        if (frame->cell == frame->tail) {
+            traversal->depth--;
+        } else {
+            frame->cell = next[frame->cell];
         }
-        if (cell2 == startcells2) return 0;
-        cell1 = next[cell1];
-        cell2 = next[cell2];
+        if (value >= FREEMIN) {
+            if (!pushtokenframe(traversal, resolvedtail(value))) return 0;
+            continue;
+        }
+        *token = value;
+        return 1;
     }
+    return 0;
 }
 
 // A packed key is the exact two-bit preorder grammar in its low 58 bits,
@@ -1550,7 +1478,9 @@ int equalcells(uint_fast32_t startcells1, uint_fast32_t startcells2, int topleve
 _Static_assert(PACKED_TOKEN_APPLICATION == 0,
                "packed application token must be zero");
 _Static_assert(((4U * MAXLEN) - 2U) <= PACKED_KEY_PAYLOAD_BITS,
-               "MAXLEN expressions must fit in packed keys");
+               "MAXLEN catalogue expressions must fit in packed keys");
+_Static_assert(((4U * MAXLEN) + 2U) <= PACKED_KEY_PAYLOAD_BITS,
+               "MAXLEN evaluation expressions must fit in packed keys");
 
 static inline unsigned packedkeybits(PackedKey key) {
     return (unsigned)(key >> PACKED_KEY_LENGTH_SHIFT);
@@ -1606,7 +1536,7 @@ static inline size_t packedkeyhash(PackedKey key, size_t mask) {
 }
 
 #if !HAS_INFINITE_H
-#define INITIAL_PACKED_KEY_CAPACITY 1048576U
+#define INITIAL_PACKED_KEY_CAPACITY 2097152U
 _Static_assert((INITIAL_PACKED_KEY_CAPACITY &
                 (INITIAL_PACKED_KEY_CAPACITY - 1U)) == 0,
                "initial packed-key capacity must be a power of two");
@@ -1864,6 +1794,53 @@ static PackedKey cellcontentpackedkey(uint_fast32_t value) {
     if (value == 'x') return PACKED_KEY_X;
     fprintf(stderr, "cannot pack character value %" PRIuFAST32 "\n", value);
     exit(EXIT_FAILURE);
+}
+
+static int cellsmatchpackedkey(ExpressionTokenTraversal *traversal,
+                               uint_fast32_t tail, PackedKey expected) {
+    unsigned remaining = packedkeybits(expected);
+    PackedKey payload = expected & PACKED_KEY_PAYLOAD_MASK;
+
+    traversal->depth = 0;
+    traversal->applicationsleft =
+        (((size_t)remaining / PACKED_KEY_TOKEN_BITS) - 1U) / 2U;
+    if (!pushtokenframe(traversal, tail)) return 0;
+    while (remaining != 0) {
+        uint_fast32_t token;
+
+        if (!nextexpressiontoken(traversal, &token)) {
+            traversal->depth = 0;
+            return 0;
+        }
+        unsigned expectedtoken =
+            (unsigned)((payload >> (remaining - PACKED_KEY_TOKEN_BITS)) &
+                       UINT64_C(3));
+        unsigned actualtoken;
+
+        if (token == 0) {
+            actualtoken = (unsigned)PACKED_TOKEN_APPLICATION;
+        } else if (token == 'S') {
+            actualtoken = (unsigned)PACKED_TOKEN_S;
+        } else if (token == 'K') {
+            actualtoken = (unsigned)PACKED_TOKEN_K;
+        } else if (token == 'x') {
+            actualtoken = (unsigned)PACKED_TOKEN_X;
+        } else {
+            traversal->depth = 0;
+            return 0;
+        }
+        if (actualtoken != expectedtoken) {
+            traversal->depth = 0;
+            return 0;
+        }
+        remaining -= PACKED_KEY_TOKEN_BITS;
+    }
+    uint_fast32_t extra;
+    int matches = (traversal->applicationsleft == 0) &&
+                  !nextexpressiontoken(traversal, &extra);
+
+    traversal->depth = 0;
+    return matches;
 }
 
 #if !HAS_INFINITE_H
@@ -2647,179 +2624,286 @@ static int exposehead(uint_fast32_t *headptr, uint_fast32_t *tailptr,
     }
 }
 
-#define RESTOREHEAD \
-if (gotx) { \
-    next[tail] = head; \
-    contents[subowner] = tail; \
-    subhead = tail; \
-} else { \
-    next[tail] = head; \
-    evalhead = tail; \
+enum NormalReduction {
+    NORMAL_REDUCTION_ERROR = -1,
+    NORMAL_REDUCTION_COMPLETE,
+    NORMAL_REDUCTION_PROGRESS
+};
+
+static void clearnormaltraversal(NormalTraversal *traversal) {
+    while (traversal->depth != 0) {
+        NormalFrame *frame = &traversal->frames[traversal->depth - 1];
+
+        if (frame->kind == NORMAL_MEMO) {
+            next[frame->owner] &= MEMO_MASK;
+        }
+        traversal->depth--;
+    }
 }
 
+static void pushnormalframe(NormalTraversal *traversal,
+                            enum NormalOwnerKind kind,
+                            uint_fast32_t owner) {
+    if (traversal->depth == traversal->capacity) {
+        size_t newcapacity = traversal->capacity
+            ? (traversal->capacity * 2) : 64;
+
+        if ((newcapacity < traversal->capacity) ||
+            (newcapacity > (SIZE_MAX / sizeof(*traversal->frames)))) {
+            fprintf(stderr, "normal-order traversal is too deep\n");
+            exit(EXIT_FAILURE);
+        }
+        NormalFrame *newframes =
+            realloc(traversal->frames, newcapacity * sizeof(*newframes));
+
+        if (newframes == NULL) {
+            fprintf(stderr,
+                    "failed to grow normal-order traversal to %zu frames\n",
+                    newcapacity);
+            exit(EXIT_FAILURE);
+        }
+        traversal->frames = newframes;
+        traversal->capacity = newcapacity;
+    }
+    NormalFrame *frame = &traversal->frames[traversal->depth++];
+
+    frame->kind = kind;
+    frame->phase = NORMAL_AT_ROOT;
+    frame->owner = owner;
+    frame->head = 0;
+    frame->tail = 0;
+    frame->cursor = 0;
+}
+
+static uint_fast32_t normalframetail(const NormalFrame *frame,
+                                     uint_fast32_t roottail) {
+    if (frame->kind == NORMAL_ROOT) return roottail;
+    return contents[frame->owner];
+}
+
+static void storenormalframetail(const NormalFrame *frame,
+                                 uint_fast32_t *roottail,
+                                 uint_fast32_t tail) {
+    if (frame->kind == NORMAL_ROOT) {
+        *roottail = tail;
+    } else {
+        contents[frame->owner] = tail;
+    }
+}
+
+static int finishnormalprogress(NormalTraversal *traversal,
+                                NormalFrame *frame,
+                                uint_fast32_t *roottail,
+                                uint_fast32_t head,
+                                uint_fast32_t tail,
+                                MemoPath *path) {
+    int exposed = exposeweakhead(&head, &tail);
+
+    next[tail] = head;
+    storenormalframetail(frame, roottail, tail);
+    clearmemopath(path);
+    if (exposed == HEAD_ERROR) {
+        clearnormaltraversal(traversal);
+        return NORMAL_REDUCTION_ERROR;
+    }
+    frame->phase = NORMAL_AT_ROOT;
+    frame->head = 0;
+    frame->tail = 0;
+    frame->cursor = 0;
+    return NORMAL_REDUCTION_PROGRESS;
+}
+
+// Contract the leftmost reachable redex in the complete logical expression.
+// Each parent ring stays closed while a nested direct ring or shared memo
+// target is inspected. After a contraction, traversal resumes at that target:
+// its ancestors and all earlier graph locations were already traversed, and a
+// shared target update is simultaneously visible at every alias.
+static int reduceleftmost(uint_fast32_t *roottail, uint_fast32_t *cost,
+                          MemoPath *path, NormalTraversal *traversal) {
+    *cost = 0;
+    clearmemopath(path);
+    if (traversal->depth == 0) {
+        pushnormalframe(traversal, NORMAL_ROOT, 0);
+    }
+
+    while (traversal->depth != 0) {
+        NormalFrame *frame = &traversal->frames[traversal->depth - 1];
+
+        if (frame->phase == NORMAL_AT_ROOT) {
+            uint_fast32_t tail = normalframetail(frame, *roottail);
+            uint_fast32_t head = next[tail];
+
+            next[tail] = 0;
+            for (;;) {
+                int exposed = exposehead(&head, &tail, cost, path);
+
+                if (exposed == HEAD_ERROR) {
+                    next[tail] = head;
+                    storenormalframetail(frame, roottail, tail);
+                    clearmemopath(path);
+                    clearnormaltraversal(traversal);
+                    return NORMAL_REDUCTION_ERROR;
+                }
+                if (exposed == HEAD_PROGRESS) {
+                    return finishnormalprogress(traversal, frame, roottail,
+                                                head, tail, path);
+                }
+                if (exposed == HEAD_CHANGED) {
+                    clearmemopath(path);
+                    continue;
+                }
+
+                int reduced = reducetop(&head, &tail, cost);
+
+                if (reduced < 0) {
+                    next[tail] = head;
+                    storenormalframetail(frame, roottail, tail);
+                    clearmemopath(path);
+                    clearnormaltraversal(traversal);
+                    return NORMAL_REDUCTION_ERROR;
+                }
+                if (reduced > 0) {
+                    return finishnormalprogress(traversal, frame, roottail,
+                                                head, tail, path);
+                }
+
+                next[tail] = head;
+                storenormalframetail(frame, roottail, tail);
+                clearmemopath(path);
+                frame->head = head;
+                frame->tail = tail;
+                frame->cursor = (head == tail) ? 0 : next[head];
+                frame->phase = NORMAL_SCANNING_ARGUMENTS;
+                break;
+            }
+            continue;
+        }
+
+        if (frame->cursor == 0) {
+            if (frame->kind == NORMAL_MEMO) {
+                next[frame->owner] =
+                    (next[frame->owner] | MEMO_NORMAL_BIT) & MEMO_MASK;
+            }
+            traversal->depth--;
+            continue;
+        }
+
+        uint_fast32_t cell = frame->cursor;
+
+        frame->cursor = (cell == frame->tail) ? 0 : next[cell];
+        uint_fast32_t value = contents[cell];
+
+        if (value < FREEMIN) continue;
+        if (ismemocontents(value)) {
+            uint_fast32_t memo = memocell(value);
+            uint_fast32_t state = next[memo];
+
+            if ((state & MEMO_NORMAL_BIT) != 0) continue;
+            if ((state & MEMO_BIT) != 0) {
+                clearmemopath(path);
+                clearnormaltraversal(traversal);
+                return NORMAL_REDUCTION_ERROR;
+            }
+            next[memo] = state | MEMO_BIT;
+            pushnormalframe(traversal, NORMAL_MEMO, memo);
+        } else {
+            pushnormalframe(traversal, NORMAL_DIRECT, cell);
+        }
+    }
+
+    return NORMAL_REDUCTION_COMPLETE;
+}
+
+static uint_fast32_t singlexargument(uint_fast32_t tail) {
+    uint_fast32_t head = next[tail];
+
+    if ((contents[head] != 'x') || (head == tail)) return 0;
+    uint_fast32_t argument = next[head];
+
+    if ((argument != tail) || (contents[argument] < FREEMIN)) return 0;
+    return resolvedtail(contents[argument]);
+}
+
+// Reduce the entire graph in leftmost-outermost order. The sole early-stop
+// exception is the fixed-point witness x(P x): reducing its argument
+// further would deliberately follow the recurrence that the search has proved.
 void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead,
                uint_fast32_t initlen, char *buffer, int doprint) {
     uint_fast32_t steps = 0;
-    int gotx = 0;
     int repeatsforever = 0;
     int gotwinner = 0;
-    uint_fast32_t cells = evalhead;
-    uint_fast32_t head;
-    uint_fast32_t tail;
-    uint_fast32_t curconts;
-    uint_fast32_t subhead = 0;
-    uint_fast32_t subowner = 0;
-    uint_fast32_t submemo = 0;
-    MemoPath *path = &evaluatorpath;
+    EvaluatorState *state = &evaluatorstate;
+    MemoPath *path = &state->memopath;
+    NormalTraversal *traversal = &state->normal;
+    ExpressionTokenTraversal *comparison = &state->comparison;
+    PackedKey initialkey = cells2packedkey(bufferhead);
 
     clearmemopath(path);
-    
+#if PARANOID
+    if (traversal->depth != 0) {
+        printf("*** Programmer error: stale normal-order traversal\n");
+        INT3
+        traversal->depth = 0;
+    }
+#else
+    traversal->depth = 0;
+#endif
+
 #if 0
     putcells(evalhead);
 #endif
 #if PARANOID
-    if (cells == 0) {
+    if (evalhead == 0) {
         printf("*** Programmer error: unexpected end of cells at evalhead\n");
-        INT3
-        return;
-    }
-#endif
-    tail = cells;
-    head = next[tail];
-    next[tail] = 0;
-    //printf("evalhead:%" PRIuFAST32 " head:%" PRIuFAST32 " tail:%" PRIuFAST32 "\n", evalhead, head, tail);
-#if PARANOID
-    if (head == tail) {
-        printf("*** Programmer error: only one item in cells at %" PRIuFAST32 "\n", evalhead);
         INT3
         return;
     }
 #endif
 
     while (steps < MAXSTEPS) {
+        uint_fast32_t beforeargument = singlexargument(evalhead);
+
+        if ((beforeargument != 0) &&
+            cellsmatchpackedkey(comparison, beforeargument, initialkey)) {
+            steps++;
+            gotwinner = 1;
+            break;
+        }
+
         uint_fast32_t reductioncost = 0;
-        int exposed = exposehead(&head, &tail, &reductioncost, path);
+        int reduced = reduceleftmost(&evalhead, &reductioncost, path,
+                                     traversal);
 
-        if (exposed == HEAD_ERROR) {
+        if (reduced == NORMAL_REDUCTION_ERROR) {
             steps = MAXSTEPS;
             break;
         }
-        if (exposed == HEAD_PROGRESS) {
-            steps += reductioncost;
-            goto reductionobserved;
-        }
-        if (exposed == HEAD_CHANGED) goto reductionobserved;
+        if (reduced == NORMAL_REDUCTION_COMPLETE) break;
 
-        cells = head;
-#if PARANOID
-        if (cells == 0) {
-            RESTOREHEAD
-            if (submemo) next[submemo] &= MEMO_MASK;
-            printf("*** Programmer error: unexpected end of cells at %" PRIuFAST32 "\n",
-                   evalhead);
-            INT3
-            return;
-        }
-#endif
-        curconts = contents[cells];
-#if PARANOID
-        if (curconts >= FREEMIN) {
-            RESTOREHEAD
-            if (submemo) next[submemo] &= MEMO_MASK;
-            printf("*** Programmer error: unresolved head at %" PRIuFAST32 "\n",
-                   evalhead);
-            INT3
-            return;
-        }
-#endif
+        steps += reductioncost;
+        uint_fast32_t afterargument = singlexargument(evalhead);
 
-        int reduced = reducetop(&head, &tail, &reductioncost);
-
-        if (reduced < 0) {
-            steps = MAXSTEPS;
+        if ((afterargument != 0) &&
+            cellsmatchpackedkey(comparison, afterargument, initialkey)) {
+            // Preserve the historical synthetic step when a root contraction
+            // first exposes x(P x). A contraction already inside x's argument
+            // needs no additional charge.
+            if (beforeargument == 0) steps++;
+            gotwinner = 1;
             break;
         }
-        if (reduced > 0) {
-            steps += reductioncost;
-            goto reductionobserved;
-        }
 
-        if (curconts == 'x') {
-            // x is only special at the head of a two-item expression.
-            if (gotx || (cells == tail)) break;
-            cells = next[cells];
-            if ((cells == 0) || (cells != tail)) break;
-            curconts = contents[cells];
-            if (curconts < FREEMIN) break;
-
-            next[tail] = head;
-            evalhead = tail;
-            if (ismemocontents(curconts)) {
-                submemo = memocell(curconts);
-                if ((next[submemo] & MEMO_BIT) != 0) {
-                    steps = MAXSTEPS;
-                    break;
-                }
-                next[submemo] |= MEMO_BIT;
-                subowner = submemo;
-                tail = contents[submemo];
-            } else {
-                subowner = cells;
-                tail = curconts;
-            }
-            head = next[tail];
-            subhead = tail;
-            gotx = 1;
-            if (equalcellspath(bufferhead, subhead, 0, path) == 0) {
-                next[tail] = 0;
-                continue;
-            }
-            reductioncost = 1;
-            steps += reductioncost;
-            goto reductionobserved;
-        }
-
-        if ((curconts == 'S') || (curconts == 'K')) break;
-
-        puts(buffer);
-        putchar('=');
-        RESTOREHEAD
-        if (submemo) next[submemo] &= MEMO_MASK;
-        putcells(evalhead);
-        fprintf(stderr, "*** Programmer error: not S, K, or x at %" PRIuFAST32 "\n",
-                evalhead);
-        INT3
-        return;
-
-reductionobserved:
-        {
-            int weakheadexposed = exposeweakhead(&head, &tail);
-
-            if (weakheadexposed == HEAD_ERROR) {
-                steps = MAXSTEPS;
-            } else if (weakheadexposed == HEAD_CHANGED) {
-                clearmemopath(path);
-            }
-        }
-        RESTOREHEAD
-        if (gotx) {
-            if (equalcellspath(bufferhead, subhead, 0, path)) {
-                gotwinner = 1;
-                break;
-            }
-        } else {
-            repeatsforever = equalcellspath(bufferhead, evalhead, 1, path);
-            if (repeatsforever) break;
-        }
-        // Reducer mutations use a temporary linear chain. Close it for the
-        // structural observations above, then reopen it for another turn.
-        next[tail] = 0;
+        // Only an exact return to the initial complete expression proves a
+        // repeat. Matching a proper subexpression says nothing about context.
+        repeatsforever = cellsmatchpackedkey(comparison, evalhead, initialkey);
+        if (repeatsforever) break;
     }
+
+    clearmemopath(path);
+    clearnormaltraversal(traversal);
 
     uint_fast32_t peakcells = (highwatermark - FREEMIN) - initlen;
 
-    RESTOREHEAD
-    if (submemo) next[submemo] &= MEMO_MASK;
     if (steps == 0) {
         if (atomic_load(&bufmaxis0)) {
             pthread_mutex_lock(&globallock);
@@ -2844,32 +2928,17 @@ reductionobserved:
             writeinfinitecombinator(bufferhead, buffer);
 #endif
             (void)atomic_fetch_add(&totalinfinitecount, 1);
-            if (repeatsforever == 1) {
-                (void)atomic_fetch_add(&repeatcount, 1);
-                if ((length <= 8) || (length == 13)) {
-                    pthread_mutex_lock(&printlock);
-                    printf("\r%s                                     \n", buffer);
-                    putchar('=');
-                    printcells(evalhead);
-                    printf(" in %" PRIuFAST32 " steps with maximum cell count %" PRIuFAST32 "\n",
-                           steps, peakcells);
-                    printf("*** Repeats forever\n\n");
-                    fflush(stdout);
-                    pthread_mutex_unlock(&printlock);
-                }
-            } else {
-                (void)atomic_fetch_add(&nevercount, 1);
-                if (length <= 6) {
-                    pthread_mutex_lock(&printlock);
-                    printf("\r%s                                     \n", buffer);
-                    putchar('=');
-                    printcells(evalhead);
-                    printf(" in %" PRIuFAST32 " steps with maximum cell count %" PRIuFAST32 "\n",
-                           steps, peakcells);
-                    printf("*** Never ends\n\n");
-                    fflush(stdout);
-                    pthread_mutex_unlock(&printlock);
-                }
+            (void)atomic_fetch_add(&repeatcount, 1);
+            if ((length <= 8) || (length == 13)) {
+                pthread_mutex_lock(&printlock);
+                printf("\r%s                                     \n", buffer);
+                putchar('=');
+                printcells(evalhead);
+                printf(" in %" PRIuFAST32 " steps with maximum cell count %" PRIuFAST32 "\n",
+                       steps, peakcells);
+                printf("*** Repeats forever\n\n");
+                fflush(stdout);
+                pthread_mutex_unlock(&printlock);
             }
         } else if (steps >= MAXSTEPS) {
 #if !HAS_INFINITE_H
@@ -3368,7 +3437,7 @@ void *threadrun(void *arg) {
             }
         }
     }
-    freememopath();
+    freeevaluatorpaths();
     return NULL;
 }
 
@@ -3720,7 +3789,7 @@ int main(int argc, char **argv) {
     int result = closeinfinitefile();
 #endif
 
-    freememopath();
+    freeevaluatorpaths();
     if ((result == EXIT_SUCCESS) && ISATTY(FILENO(stdin))) {
         puts("\nPress any key to exit");
         getchar();

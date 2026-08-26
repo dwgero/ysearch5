@@ -1,2 +1,0 @@
-Target dependency graph (1 target)
-Target 'ysearch5' in project 'ysearch5' (no dependencies)

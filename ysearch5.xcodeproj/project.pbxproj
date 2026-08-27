@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		63A000083041000000000008 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = 63A0000A304100000000000A /* main.c */; };
+		63A000093041000000000009 /* makeinfh.c in Sources */ = {isa = PBXBuildFile; fileRef = 63A0000B304100000000000B /* makeinfh.c */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		63C29586303A3D8B005CD756 /* CopyFiles */ = {
 			isa = PBXCopyFilesBuildPhase;
@@ -19,18 +24,26 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		634035A6303F87A70023625C /* ysearch5.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; path = ysearch5.xcodeproj; sourceTree = "<group>"; };
+		63A000013041000000000001 /* makeinfh */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = makeinfh; sourceTree = BUILT_PRODUCTS_DIR; };
+		63A0000A304100000000000A /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
+		63A0000B304100000000000B /* makeinfh.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = makeinfh.c; sourceTree = "<group>"; };
+		63A0000C304100000000000C /* infinite.cmb */ = {isa = PBXFileReference; lastKnownFileType = text; path = infinite.cmb; sourceTree = "<group>"; };
+		63A0000D304100000000000D /* infinite.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = infinite.h; sourceTree = "<group>"; };
+		63A0000E304100000000000E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		63A0000F304100000000000F /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		63C29588303A3D8B005CD756 /* ysearch5 */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = ysearch5; sourceTree = BUILT_PRODUCTS_DIR; };
+		63D60E633040DA5E00F8DDAB /* ysearch5.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; path = ysearch5.xcodeproj; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
-/* Begin PBXFileSystemSynchronizedRootGroup section */
-		63C2958A303A3D8B005CD756 /* ysearch5 */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = ysearch5;
-			sourceTree = "<group>";
-		};
-/* End PBXFileSystemSynchronizedRootGroup section */
-
 /* Begin PBXFrameworksBuildPhase section */
+		63A000043041000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		63C29585303A3D8B005CD756 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -41,6 +54,11 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		634035A7303F87A70023625C /* Products */ = {
+			isa = PBXGroup;
+			name = Products;
+			sourceTree = "<group>";
+		};
 		63C2957F303A3D8B005CD756 = {
 			isa = PBXGroup;
 			children = (
@@ -49,17 +67,54 @@
 			);
 			sourceTree = "<group>";
 		};
+		63C2958A303A3D8B005CD756 /* ysearch5 */ = {
+			isa = PBXGroup;
+			children = (
+				63A0000A304100000000000A /* main.c */,
+				63A0000B304100000000000B /* makeinfh.c */,
+				63A0000C304100000000000C /* infinite.cmb */,
+				63A0000D304100000000000D /* infinite.h */,
+				63A0000E304100000000000E /* README.md */,
+				63A0000F304100000000000F /* LICENSE */,
+			);
+			name = ysearch5;
+			sourceTree = "<group>";
+		};
 		63C29589303A3D8B005CD756 /* Products */ = {
 			isa = PBXGroup;
 			children = (
 				63C29588303A3D8B005CD756 /* ysearch5 */,
+				63A000013041000000000001 /* makeinfh */,
 			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		63D60E643040DA5E00F8DDAB /* Products */ = {
+			isa = PBXGroup;
 			name = Products;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		63A000023041000000000002 /* makeinfh */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 63A000073041000000000007 /* Build configuration list for PBXNativeTarget "makeinfh" */;
+			buildPhases = (
+				63A000033041000000000003 /* Sources */,
+				63A000043041000000000004 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = makeinfh;
+			packageProductDependencies = (
+			);
+			productName = makeinfh;
+			productReference = 63A000013041000000000001 /* makeinfh */;
+			productType = "com.apple.product-type.tool";
+		};
 		63C29587303A3D8B005CD756 /* ysearch5 */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 63C2958F303A3D8B005CD756 /* Build configuration list for PBXNativeTarget "ysearch5" */;
@@ -71,9 +126,6 @@
 			buildRules = (
 			);
 			dependencies = (
-			);
-			fileSystemSynchronizedGroups = (
-				63C2958A303A3D8B005CD756 /* ysearch5 */,
 			);
 			name = ysearch5;
 			packageProductDependencies = (
@@ -91,6 +143,9 @@
 				BuildIndependentTargetsInParallel = 1;
 				LastUpgradeCheck = 2660;
 				TargetAttributes = {
+					63A000023041000000000002 = {
+						CreatedOnToolsVersion = 26.6;
+					};
 					63C29587303A3D8B005CD756 = {
 						CreatedOnToolsVersion = 26.6;
 					};
@@ -108,24 +163,67 @@
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 63C29589303A3D8B005CD756 /* Products */;
 			projectDirPath = "";
+			projectReferences = (
+				{
+					ProductGroup = 634035A7303F87A70023625C /* Products */;
+					ProjectRef = 634035A6303F87A70023625C /* ysearch5.xcodeproj */;
+				},
+				{
+					ProductGroup = 63D60E643040DA5E00F8DDAB /* Products */;
+					ProjectRef = 63D60E633040DA5E00F8DDAB /* ysearch5.xcodeproj */;
+				},
+			);
 			projectRoot = "";
 			targets = (
 				63C29587303A3D8B005CD756 /* ysearch5 */,
+				63A000023041000000000002 /* makeinfh */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXSourcesBuildPhase section */
+		63A000033041000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				63A000093041000000000009 /* makeinfh.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		63C29584303A3D8B005CD756 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				63A000083041000000000008 /* main.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
+		63A000053041000000000005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				EXCLUDED_SOURCE_FILE_NAMES = main.c;
+				"OTHER_CFLAGS[arch=*]" = "-march=native";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		63A000063041000000000006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				EXCLUDED_SOURCE_FILE_NAMES = main.c;
+				"OTHER_CFLAGS[sdk=macosx*][arch=arm64]" = (
+					"-march=native",
+					"-DNDEBUG",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
 		63C2958D303A3D8B005CD756 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -227,6 +325,7 @@
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 3;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
 				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
 				GCC_WARN_UNDECLARED_SELECTOR = YES;
@@ -246,6 +345,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				EXCLUDED_SOURCE_FILE_NAMES = makeinfh.c;
+				"OTHER_CFLAGS[arch=*]" = "-march=native";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Debug;
@@ -255,6 +355,10 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				EXCLUDED_SOURCE_FILE_NAMES = makeinfh.c;
+				"OTHER_CFLAGS[sdk=macosx*][arch=arm64]" = (
+					"-march=native",
+					"-DNDEBUG",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Release;
@@ -262,6 +366,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		63A000073041000000000007 /* Build configuration list for PBXNativeTarget "makeinfh" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				63A000053041000000000005 /* Debug */,
+				63A000063041000000000006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		63C29583303A3D8B005CD756 /* Build configuration list for PBXProject "ysearch5" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

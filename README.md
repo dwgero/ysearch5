@@ -38,9 +38,11 @@ reported as `Never ends`; other cycles need not be recognized before reaching
 a resource limit. Resource exhaustion is an operational classification, not a
 proof of mathematical divergence.
 
-Divergent and resource-exhausted candidates can be recorded in `infinite.cmb`.
-Catalogue lookups are exact complete-expression matches, never prefix or
-nested-subexpression matches.
+An existing `infinite.cmb` can seed the search with divergent and
+resource-exhausted candidates. Catalogue lookups are exact
+complete-expression matches, never prefix or nested-subexpression matches.
+New classifications are retained in memory and written to `infinite.h` at
+successful shutdown; `main.c` never creates or modifies `infinite.cmb`.
 
 ## Requirements
 
@@ -73,10 +75,9 @@ Running `ysearch5` this way took 4 seconds on a MacBook Pro M4 Max with 16 cores
 
 ## Create `infinite.cmb` from `infinite.h`
 
-`makeinfcmb` performs the inverse of `makeinfh`. It reads `infinite.h` beside
-its resolved executable, validates the declared table size, key count, sparse
-indices, and packed expression trees, then creates `infinite.cmb` in the same
-directory.
+`makeinfcmb` reads `infinite.h` beside its resolved executable, validates the
+declared table size, key count, sparse indices, and packed expression trees,
+then creates `infinite.cmb` in the same directory.
 
 For example, create the catalogue in a separate `build` directory:
 ```sh
@@ -94,14 +95,13 @@ atomically only after the complete new catalogue has been written
 successfully.
 
 The readable-expression order may differ from a catalogue produced during a
-search, but the key set is identical. Running `makeinfh` on the reconstructed
-catalogue reproduces the original generated hash table.
+search, but the key set is identical.
 
 ## Bootstrap without `infinite.cmb` or `infinite.h`
 
-These steps use a separate `build` directory. Both `ysearch5` and `makeinfh`
-locate their data files relative to their own resolved executable paths, not
-relative to the shell's current directory.
+These steps use a separate `build` directory. `ysearch5` locates its catalogue
+files relative to its own resolved executable path, not relative to the
+shell's current directory.
 
 ### 1. Create the build directory
 ```sh
@@ -125,46 +125,22 @@ xcrun clang \
 ```sh
 ./build/ysearch5-noh
 ```
-Because no catalogue exists, the program creates `build/infinite.cmb` and
-writes each newly classified divergent combinator as:
-```text
-0x<16-hex-digit-packed-key>: <readable-SK-expression>
-```
-The file begins with comment lines whose first non-whitespace character is
-`*`. Both `main.c` and `makeinfh.c` ignore those lines when reading it.
-
-The catalogue is complete only after the program exits successfully. If the
-run is interrupted or crashes, move or remove the partial
-`build/infinite.cmb` before restarting an uncached search; a truncated final
-record is intentionally rejected.
+Because no catalogue exists, the program retains each newly classified
+divergent key in memory. It does not create `build/infinite.cmb`. At successful
+shutdown it constructs the complete hash table and atomically creates
+`build/infinite.h`. If the run is interrupted or crashes, no partial header
+replaces an existing `build/infinite.h`.
 
 Catalogues are specific to the evaluator semantics and configured resource
 ceilings; the file format does not carry a version or those limits. To
 generate a complete current catalogue, start the file-backed executable
 with no `infinite.cmb` beside it.
 
-Running `ysearch5-noh` to create `infinite.cmb` took 40 minutes on a
-MacBook Pro M4 Max with 16 cores.  Running it a second time with the newly
-created `infinite.cmb` took 5 seconds.
+Running the uncached `ysearch5-noh` search took 40 minutes on a MacBook Pro M4
+Max with 16 cores. Running it with the complete existing `infinite.cmb` cache
+took 5 seconds.
 
-### 4. Compile the header generator
-
-Place the generator executable beside the completed catalogue:
-```sh
-xcrun clang \
-  -std=c11 -O3 -march=native -DNDEBUG \
-  -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror \
-  makeinfh.c -o build/makeinfh
-```
-### 5. Generate `infinite.h`
-```sh
-./build/makeinfh
-```
-`makeinfh` validates every packed key against its readable expression, sorts
-and deduplicates the keys, constructs the final 2,097,152-slot hash table, and
-writes `build/infinite.h`.
-
-### 6. Compile the embedded-catalogue search
+### 4. Compile the embedded-catalogue search
 
 The generated header is in `build`, so add that directory to the include
 path:
@@ -179,12 +155,14 @@ Run the embedded version with:
 ```sh
 ./build/ysearch5
 ```
-## File-backed reuse without generating a header
+## File-backed reuse with an existing `infinite.cmb`
 
 If a valid `infinite.cmb` already exists beside a file-backed `ysearch5`
 executable, the program loads it as a read-only exact-match cache. It does not
 truncate or add to an existing catalogue. Newly discovered divergences are
 reported in the program's totals but are not appended to that preloaded file.
+At successful shutdown it atomically creates or replaces `infinite.h` beside
+the executable from the union of the preloaded and newly classified keys.
 
 ## Parallelism and limits
 

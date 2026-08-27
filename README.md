@@ -71,6 +71,32 @@ read or write `infinite.cmb` at runtime.
 
 Running `ysearch5` this way took 4 seconds on a MacBook Pro M4 Max with 16 cores.
 
+## Create `infinite.cmb` from `infinite.h`
+
+`makeinfcmb` performs the inverse of `makeinfh`. It reads `infinite.h` beside
+its resolved executable, validates the declared table size, key count, sparse
+indices, and packed expression trees, then creates `infinite.cmb` in the same
+directory.
+
+For example, create the catalogue in a separate `build` directory:
+```sh
+mkdir -p build
+cp infinite.h build/infinite.h
+xcrun clang \
+  -std=c11 -O3 -march=native -DNDEBUG \
+  -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror \
+  makeinfcmb.c -o build/makeinfcmb
+./build/makeinfcmb
+```
+This writes `build/infinite.cmb`. Keys are sorted so the output is
+deterministic. If `build/infinite.cmb` already exists, it is replaced
+atomically only after the complete new catalogue has been written
+successfully.
+
+The readable-expression order may differ from a catalogue produced during a
+search, but the key set is identical. Running `makeinfh` on the reconstructed
+catalogue reproduces the original generated hash table.
+
 ## Bootstrap without `infinite.cmb` or `infinite.h`
 
 These steps use a separate `build` directory. Both `ysearch5` and `makeinfh`

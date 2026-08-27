@@ -69,6 +69,8 @@ Run it with:
 The packed-key hash table is compiled into the executable. This mode does not
 read or write `infinite.cmb` at runtime.
 
+Running `ysearch5` this way took 4 seconds on a MacBook Pro M4 Max with 16 cores.
+
 ## Bootstrap without `infinite.cmb` or `infinite.h`
 
 These steps use a separate `build` directory. Both `ysearch5` and `makeinfh`
@@ -114,6 +116,10 @@ Catalogues are specific to the evaluator semantics and configured resource
 ceilings; the file format does not carry a version or those limits. To
 generate a complete current catalogue, start the file-backed executable
 with no `infinite.cmb` beside it.
+
+Running `ysearch5-noh` to create `infinite.cmb` took 40 minutes on a
+MacBook Pro M4 Max with 16 cores.  Running it a second time with the newly
+created `infinite.cmb` took 5 seconds.
 
 ### 4. Compile the header generator
 

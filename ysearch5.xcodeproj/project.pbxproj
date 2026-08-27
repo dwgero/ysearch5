@@ -28,6 +28,7 @@
 		63A000013041000000000001 /* makeinfh */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = makeinfh; sourceTree = BUILT_PRODUCTS_DIR; };
 		63A0000A304100000000000A /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 		63A0000B304100000000000B /* makeinfh.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = makeinfh.c; sourceTree = "<group>"; };
+		63A000103041000000000010 /* makeinfcmb.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = makeinfcmb.c; sourceTree = "<group>"; };
 		63A0000C304100000000000C /* infinite.cmb */ = {isa = PBXFileReference; lastKnownFileType = text; path = infinite.cmb; sourceTree = "<group>"; };
 		63A0000D304100000000000D /* infinite.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = infinite.h; sourceTree = "<group>"; };
 		63A0000E304100000000000E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
@@ -72,6 +73,7 @@
 			children = (
 				63A0000A304100000000000A /* main.c */,
 				63A0000B304100000000000B /* makeinfh.c */,
+				63A000103041000000000010 /* makeinfcmb.c */,
 				63A0000C304100000000000C /* infinite.cmb */,
 				63A0000D304100000000000D /* infinite.h */,
 				63A0000E304100000000000E /* README.md */,

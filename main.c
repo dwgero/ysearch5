@@ -48,10 +48,12 @@
 // Handle platform differences for isatty and fileno
 #if defined(_WIN32) || defined(_WIN64)
     #include <io.h>
+    #include <conio.h>
     #define ISATTY _isatty
     #define FILENO _fileno
 #else
     #include <unistd.h>
+    #include <termios.h>
     #define ISATTY isatty
     #define FILENO fileno
 #endif
@@ -3885,7 +3887,30 @@ int main(int argc, char **argv) {
     freeevaluatorpaths();
     if ((result == EXIT_SUCCESS) && ISATTY(FILENO(stdin))) {
         puts("\nPress any key to exit");
-        getchar();
+
+#if defined(_WIN32) || defined(_WIN64)
+        _getch();
+#else
+        int inputfd = FILENO(stdin);
+        struct termios oldsettings;
+
+        if (tcgetattr(inputfd, &oldsettings) < 0) {
+            perror("tcgetattr");
+        } else {
+            struct termios newsettings = oldsettings;
+
+            newsettings.c_lflag &=
+                (tcflag_t)~((tcflag_t)ICANON | (tcflag_t)ECHO);
+            if (tcsetattr(inputfd, TCSANOW, &newsettings) < 0) {
+                perror("tcsetattr");
+            } else {
+                (void)getchar();
+                if (tcsetattr(inputfd, TCSADRAIN, &oldsettings) < 0) {
+                    perror("tcsetattr");
+                }
+            }
+        }
+#endif
     }
     return result;
 }

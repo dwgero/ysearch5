@@ -32,12 +32,10 @@ equals the original `P x`. A winner is not normalized further: doing so would
 force the very recurrence that the program has just established.
 
 Otherwise, a candidate terminates only when no reachable S/K redex remains.
-In both build modes, `Repeats forever` means the complete expression returned
-to its initial `P x` state or reached `(P x) Q R ...`, where the leftmost
-application-spine prefix is exactly the initial `P x` and at least one suffix
-argument is present. A proper nested occurrence does not qualify.
-Memo cycles and configured step/cell exhaustion are reported as `Never ends`;
-other cycles need not be recognized before reaching a resource limit.
+The evaluator does not check for repeating expressions because doing so has a
+large runtime cost. Memo cycles and configured step/cell exhaustion are
+reported as `Never ends`; other cycles need not be recognized before reaching
+a resource limit.
 Resource exhaustion is an operational classification, not a proof of
 mathematical divergence.
 
@@ -139,7 +137,7 @@ ceilings; the file format does not carry a version or those limits. To
 generate a complete current catalogue, start the file-backed executable
 with no `infinite.cmb` beside it.
 
-Running the uncached `ysearch5-noh` search took 40 minutes on a MacBook Pro M4
+Running the uncached `ysearch5-noh` search took 33 minutes on a MacBook Pro M4
 Max with 16 cores. Running it with the complete existing `infinite.cmb` cache
 took 5 seconds.
 

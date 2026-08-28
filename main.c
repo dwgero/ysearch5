@@ -301,7 +301,6 @@ static void destroypackedkeyset(PackedKeySet *set);
 static int writeinfiniteheader(void);
 #endif
 
-_Atomic(uint_fast32_t) repeatcount = 0;
 _Atomic(uint_fast32_t) nevercount = 0;
 _Atomic(uint_fast32_t) totalinfinitecount = 0;
 _Atomic(uint_fast32_t) neverendsmatch = 0;
@@ -1985,79 +1984,6 @@ static int cellsmatchpackedkey(ExpressionTokenTraversal *traversal,
     return matches;
 }
 
-static int cellshavepackedkeyprefix(ExpressionTokenTraversal *traversal,
-                                    uint_fast32_t tail, PackedKey prefix) {
-    unsigned prefixbits = packedkeybits(prefix);
-    PackedKey payload = prefix & PACKED_KEY_PAYLOAD_MASK;
-    size_t prefixleadingapplications = 0;
-
-    while ((prefixleadingapplications * PACKED_KEY_TOKEN_BITS) < prefixbits) {
-        unsigned shift = prefixbits -
-            (unsigned)(prefixleadingapplications * PACKED_KEY_TOKEN_BITS) -
-            PACKED_KEY_TOKEN_BITS;
-
-        if (((payload >> shift) & UINT64_C(3)) !=
-            PACKED_TOKEN_APPLICATION) break;
-        prefixleadingapplications++;
-    }
-    traversal->depth = 0;
-    traversal->applicationsleft = MAXARRAY;
-    if (!pushtokenframe(traversal, tail)) return 0;
-    size_t actualleadingapplications = 0;
-    uint_fast32_t token;
-
-    while (nextexpressiontoken(traversal, &token) && (token == 0)) {
-        actualleadingapplications++;
-    }
-    traversal->depth = 0;
-    if (actualleadingapplications <= prefixleadingapplications) return 0;
-    size_t extraapplications =
-        actualleadingapplications - prefixleadingapplications;
-    unsigned remaining = prefixbits;
-
-    traversal->applicationsleft =
-        ((((size_t)remaining / PACKED_KEY_TOKEN_BITS) - 1U) / 2U) +
-        extraapplications;
-    if (!pushtokenframe(traversal, tail)) return 0;
-    for (size_t i = 0; i < extraapplications; ++i) {
-        if (!nextexpressiontoken(traversal, &token) || (token != 0)) {
-            traversal->depth = 0;
-            return 0;
-        }
-    }
-    while (remaining != 0) {
-        if (!nextexpressiontoken(traversal, &token)) {
-            traversal->depth = 0;
-            return 0;
-        }
-        unsigned expectedtoken =
-            (unsigned)((payload >> (remaining - PACKED_KEY_TOKEN_BITS)) &
-                       UINT64_C(3));
-        unsigned actualtoken;
-
-        if (token == 0) {
-            actualtoken = (unsigned)PACKED_TOKEN_APPLICATION;
-        } else if (token == 'S') {
-            actualtoken = (unsigned)PACKED_TOKEN_S;
-        } else if (token == 'K') {
-            actualtoken = (unsigned)PACKED_TOKEN_K;
-        } else if (token == 'x') {
-            actualtoken = (unsigned)PACKED_TOKEN_X;
-        } else {
-            traversal->depth = 0;
-            return 0;
-        }
-        if (actualtoken != expectedtoken) {
-            traversal->depth = 0;
-            return 0;
-        }
-        remaining -= PACKED_KEY_TOKEN_BITS;
-    }
-    int matches = traversal->applicationsleft == 0;
-
-    traversal->depth = 0;
-    return matches;
-}
 #if !HAS_INFINITE_H
 static PackedKey cells2packedkeywithoutfinal(uint_fast32_t tail) {
     uint_fast32_t cell = next[tail];
@@ -3031,7 +2957,6 @@ static uint_fast32_t singlexargument(uint_fast32_t tail) {
 void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead,
                uint_fast32_t initlen, char *buffer, int doprint) {
     uint_fast32_t steps = 0;
-    int repeatsforever = 0;
     int gotwinner = 0;
     EvaluatorState *state = &evaluatorstate;
     MemoPath *path = &state->memopath;
@@ -3093,15 +3018,6 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             gotwinner = 1;
             break;
         }
-
-        // A return to P x or any (P x) Q R ... extension is a repeat. The
-        // latter has the complete P x as its left application-spine prefix.
-        repeatsforever = cellsmatchpackedkey(comparison, evalhead, initialkey);
-        if (!repeatsforever) {
-            repeatsforever =
-                cellshavepackedkeyprefix(comparison, evalhead, initialkey);
-        }
-        if (repeatsforever) break;
     }
 
     clearmemopath(path);
@@ -3128,24 +3044,7 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             pthread_mutex_unlock(&globallock);
         }
     } else {
-        if (repeatsforever) {
-#if !HAS_INFINITE_H
-            recordinfinitecombinator(bufferhead, buffer);
-#endif
-            (void)atomic_fetch_add(&totalinfinitecount, 1);
-            (void)atomic_fetch_add(&repeatcount, 1);
-            if ((length <= 8) || (length == 13)) {
-                pthread_mutex_lock(&printlock);
-                printf("\r%s                                     \n", buffer);
-                putchar('=');
-                printcells(evalhead);
-                printf(" in %" PRIuFAST32 " steps with maximum cell count %" PRIuFAST32 "\n",
-                       steps, peakcells);
-                printf("*** Repeats forever\n\n");
-                fflush(stdout);
-                pthread_mutex_unlock(&printlock);
-            }
-        } else if (steps >= MAXSTEPS) {
+        if (steps >= MAXSTEPS) {
 #if !HAS_INFINITE_H
             recordinfinitecombinator(bufferhead, buffer);
 #endif
@@ -3918,7 +3817,6 @@ int main(int argc, char **argv) {
         bufmax[0] = '\0';
         atomic_store(&bufmaxis0, 1);
         bufmaxlen[0] = '\0';
-        atomic_store(&repeatcount, 0);
         atomic_store(&nevercount, 0);
         atomic_store(&checked, 0);
         for (unsigned nextnum = startnum(length); nextnum <= lastnum; nextnum += 4) {
@@ -3963,16 +3861,6 @@ int main(int argc, char **argv) {
             printf("\nNever ends:%" PRIuFAST32 "", nevcnt);
         }
         
-        uint_fast32_t rptcnt = atomic_load(&repeatcount);
-        
-        if (rptcnt) {
-            if (nevcnt) {
-                putchar(' ');
-            } else {
-                putchar('\n');
-            }
-            printf("Repeats forever:%" PRIuFAST32 "", rptcnt);
-        }
         putchar('\n');
         printf("Total new infinites:%" PRIuFAST32,
                atomic_load(&totalinfinitecount));

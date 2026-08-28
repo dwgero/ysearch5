@@ -32,11 +32,14 @@ equals the original `P x`. A winner is not normalized further: doing so would
 force the very recurrence that the program has just established.
 
 Otherwise, a candidate terminates only when no reachable S/K redex remains.
-`Repeats forever` means the complete expression returned exactly to its
-initial `P x` state. Memo cycles and configured step/cell exhaustion are
-reported as `Never ends`; other cycles need not be recognized before reaching
-a resource limit. Resource exhaustion is an operational classification, not a
-proof of mathematical divergence.
+In both build modes, `Repeats forever` means the complete expression returned
+to its initial `P x` state or reached `(P x) Q R ...`, where the leftmost
+application-spine prefix is exactly the initial `P x` and at least one suffix
+argument is present. A proper nested occurrence does not qualify.
+Memo cycles and configured step/cell exhaustion are reported as `Never ends`;
+other cycles need not be recognized before reaching a resource limit.
+Resource exhaustion is an operational classification, not a proof of
+mathematical divergence.
 
 An existing `infinite.cmb` can seed the search with divergent and
 resource-exhausted candidates. Catalogue lookups are exact

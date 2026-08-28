@@ -1985,6 +1985,79 @@ static int cellsmatchpackedkey(ExpressionTokenTraversal *traversal,
     return matches;
 }
 
+static int cellshavepackedkeyprefix(ExpressionTokenTraversal *traversal,
+                                    uint_fast32_t tail, PackedKey prefix) {
+    unsigned prefixbits = packedkeybits(prefix);
+    PackedKey payload = prefix & PACKED_KEY_PAYLOAD_MASK;
+    size_t prefixleadingapplications = 0;
+
+    while ((prefixleadingapplications * PACKED_KEY_TOKEN_BITS) < prefixbits) {
+        unsigned shift = prefixbits -
+            (unsigned)(prefixleadingapplications * PACKED_KEY_TOKEN_BITS) -
+            PACKED_KEY_TOKEN_BITS;
+
+        if (((payload >> shift) & UINT64_C(3)) !=
+            PACKED_TOKEN_APPLICATION) break;
+        prefixleadingapplications++;
+    }
+    traversal->depth = 0;
+    traversal->applicationsleft = MAXARRAY;
+    if (!pushtokenframe(traversal, tail)) return 0;
+    size_t actualleadingapplications = 0;
+    uint_fast32_t token;
+
+    while (nextexpressiontoken(traversal, &token) && (token == 0)) {
+        actualleadingapplications++;
+    }
+    traversal->depth = 0;
+    if (actualleadingapplications <= prefixleadingapplications) return 0;
+    size_t extraapplications =
+        actualleadingapplications - prefixleadingapplications;
+    unsigned remaining = prefixbits;
+
+    traversal->applicationsleft =
+        ((((size_t)remaining / PACKED_KEY_TOKEN_BITS) - 1U) / 2U) +
+        extraapplications;
+    if (!pushtokenframe(traversal, tail)) return 0;
+    for (size_t i = 0; i < extraapplications; ++i) {
+        if (!nextexpressiontoken(traversal, &token) || (token != 0)) {
+            traversal->depth = 0;
+            return 0;
+        }
+    }
+    while (remaining != 0) {
+        if (!nextexpressiontoken(traversal, &token)) {
+            traversal->depth = 0;
+            return 0;
+        }
+        unsigned expectedtoken =
+            (unsigned)((payload >> (remaining - PACKED_KEY_TOKEN_BITS)) &
+                       UINT64_C(3));
+        unsigned actualtoken;
+
+        if (token == 0) {
+            actualtoken = (unsigned)PACKED_TOKEN_APPLICATION;
+        } else if (token == 'S') {
+            actualtoken = (unsigned)PACKED_TOKEN_S;
+        } else if (token == 'K') {
+            actualtoken = (unsigned)PACKED_TOKEN_K;
+        } else if (token == 'x') {
+            actualtoken = (unsigned)PACKED_TOKEN_X;
+        } else {
+            traversal->depth = 0;
+            return 0;
+        }
+        if (actualtoken != expectedtoken) {
+            traversal->depth = 0;
+            return 0;
+        }
+        remaining -= PACKED_KEY_TOKEN_BITS;
+    }
+    int matches = traversal->applicationsleft == 0;
+
+    traversal->depth = 0;
+    return matches;
+}
 #if !HAS_INFINITE_H
 static PackedKey cells2packedkeywithoutfinal(uint_fast32_t tail) {
     uint_fast32_t cell = next[tail];
@@ -3021,9 +3094,13 @@ void evalcells(unsigned length, uint_fast32_t bufferhead, uint_fast32_t evalhead
             break;
         }
 
-        // Only an exact return to the initial complete expression proves a
-        // repeat. Matching a proper subexpression says nothing about context.
+        // A return to P x or any (P x) Q R ... extension is a repeat. The
+        // latter has the complete P x as its left application-spine prefix.
         repeatsforever = cellsmatchpackedkey(comparison, evalhead, initialkey);
+        if (!repeatsforever) {
+            repeatsforever =
+                cellshavepackedkeyprefix(comparison, evalhead, initialkey);
+        }
         if (repeatsforever) break;
     }
 

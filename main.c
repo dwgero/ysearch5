@@ -103,15 +103,6 @@
 #include "infinite.h"
 #endif
 
-#define MAXTHREADALLOC 64
-_Static_assert(MAXTHREADALLOC >= 1 && MAXTHREADALLOC <= 64,
-               "MAXTHREADALLOC must be between 1 and 64");
-
-#if !SINGLE_THREAD
-    static int maxthreads;
-    static uint64_t allthreadsmask;
-#endif
-
 #if defined(__clang__)
     #define DEBUG_TRAP() __builtin_debugtrap()
 #elif defined(__GNUC__)
@@ -126,6 +117,8 @@ _Static_assert(MAXTHREADALLOC >= 1 && MAXTHREADALLOC <= 64,
 #else
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
+
+static char version[] = "1.7.0";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -250,6 +243,7 @@ char *infinitepath;
 #if SINGLE_THREAD
     #define next nxt[0]
     #define contents cnts[0]
+
     static uint_fast32_t highwatermark;
     static uint_fast32_t freelist;
 #else
@@ -259,12 +253,20 @@ char *infinitepath;
         uint_fast32_t freelist_value;
     } ThreadAllocatorState;
     PERTHREAD static ThreadAllocatorState allocatorstate;
+
     #define myid allocatorstate.id
     #define next nxt[myid]
     #define contents cnts[myid]
     #define highwatermark allocatorstate.highwatermark_value
     #define freelist allocatorstate.freelist_value
+
+    static int maxthreads;
+    static uint64_t allthreadsmask;
 #endif
+
+#define MAXTHREADALLOC 64
+_Static_assert(MAXTHREADALLOC >= 1 && MAXTHREADALLOC <= 64,
+               "MAXTHREADALLOC must be between 1 and 64");
 
 uint_fast32_t *nxt[MAXTHREADALLOC];
 uint_fast32_t *cnts[MAXTHREADALLOC];
@@ -3696,9 +3698,9 @@ void threadfinal(void) {
 
 int main(int argc, char **argv) {
     (void)argc;
-#if !SINGLE_THREAD
-    setmaxthreads();
-#endif
+
+    printf("ysearch5 Version %s\n", version);
+
 #if HAS_INFINITE_H
     (void)argv;
 
@@ -3722,6 +3724,7 @@ int main(int argc, char **argv) {
     }
     atomic_store(&initdone, 1);
 #else
+    setmaxthreads();
     threadinit();
 #endif
 

@@ -92,6 +92,9 @@
 #ifndef PRINTMAXES
 #define PRINTMAXES 1
 #endif
+#ifndef DOEXITKEY
+#define DOEXITKEY 0
+#endif
 #ifndef HAS_INFINITE_H
 #define HAS_INFINITE_H 1
 #endif
@@ -3901,6 +3904,7 @@ int main(int argc, char **argv) {
 #endif
 
     freeevaluatorpaths();
+#if DOEXITKEY
     if ((result == EXIT_SUCCESS) && ISATTY(FILENO(stdin))) {
         puts("\nPress any key to exit");
 
@@ -3928,5 +3932,6 @@ int main(int argc, char **argv) {
         }
 #endif
     }
+#endif
     return result;
 }

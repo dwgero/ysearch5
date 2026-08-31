@@ -75,7 +75,6 @@
 #define MAXSTEPS maxsteps
 #define MAXARRAY (32U * 1024U)
 #define WORKER_STACK_SIZE (1024U * 1024U)
-#define MAXSTR_LAST 20480U
 
 #ifndef SINGLE_THREAD
 #define SINGLE_THREAD 0
@@ -118,7 +117,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.7.1";
+static char version[] = "1.7.2";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -195,6 +194,7 @@ static inline unsigned popcount32(uint32_t x)
 }
 #endif
 
+#define MAXSTR_LAST 20480U
 static const uint_fast32_t maxstrtable[MAXLEN] = {
     // 0    1     2     3     4     5     6
     1024, 1024, 1024, 1024, 1024, 1024, 1024,

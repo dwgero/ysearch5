@@ -75,7 +75,7 @@
 #define MAXSTEPS maxsteps
 #define MAXARRAY (32U * 1024U)
 #define WORKER_STACK_SIZE (1024U * 1024U)
-#define MAXSTRTABLE_11 20480U
+#define MAXSTR_LAST 20480U
 
 #ifndef SINGLE_THREAD
 #define SINGLE_THREAD 0
@@ -118,7 +118,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.7.0";
+static char version[] = "1.7.1";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -195,27 +195,23 @@ static inline unsigned popcount32(uint32_t x)
 }
 #endif
 
-uint_fast32_t maxstrtable[12] = {
+static const uint_fast32_t maxstrtable[MAXLEN] = {
     // 0    1     2     3     4     5     6
     1024, 1024, 1024, 1024, 1024, 1024, 1024,
-    // 7    8     9    10    11
-    1024, 2048, 4096, 4096, MAXSTRTABLE_11
+    // 7    8     9    10     11
+    1024, 2048, 4096, 4096, MAXSTR_LAST
 };
 
-uint_fast32_t maxsteptable[12] = {
+static const uint_fast32_t maxsteptable[MAXLEN] = {
     // 0    1     2     3     4     5     6
     1024, 1024, 1024, 1024, 1024, 1024, 1024,
-    // 7    8     9     10     11
+    // 7    8     9     10      11
     2048, 2048, 4096, 10240, 2048000
 };
 
-_Static_assert(MAXLEN <= (sizeof(maxstrtable) / sizeof(maxstrtable[0])),
-               "MAXLEN exceeds maxstrtable capacity");
-_Static_assert(MAXLEN <= (sizeof(maxsteptable) / sizeof(maxsteptable[0])),
-               "MAXLEN exceeds maxsteptable capacity");
 _Static_assert(MAXLEN >= 1, "MAXLEN must include at least one leaf");
-_Static_assert(MAXSTRTABLE_11 < MAXARRAY,
-               "maxstrtable[11] must be less than MAXARRAY");
+_Static_assert(MAXSTR_LAST < MAXARRAY,
+               "final maxstrtable value must be less than MAXARRAY");
 
 uint_fast32_t maxstr = 1024;
 uint_fast32_t maxsteps = 1024;

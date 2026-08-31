@@ -283,12 +283,26 @@ _Static_assert((uint_fast32_t)MAXARRAY < MEMO_NORMAL_BIT,
                "arena indices and memo references must fit below memo flags");
 typedef uint64_t PackedKey;
 
+#define PACKED_KEY_INITIAL_CAPACITY (512U * 1024U)
+#define PACKED_KEY_MAX_LEVELS 16U
+#define PACKED_KEY_PROBE_DEPTH 32U
+#define PACKED_KEY_TOTAL_CAPACITY ((2U * PACKED_KEY_INITIAL_CAPACITY) - 16U)
+_Static_assert((PACKED_KEY_INITIAL_CAPACITY &
+                (PACKED_KEY_INITIAL_CAPACITY - 1U)) == 0U,
+               "initial packed-key capacity must be a power of two");
+_Static_assert((PACKED_KEY_INITIAL_CAPACITY >>
+                (PACKED_KEY_MAX_LEVELS - 1U)) == 16U,
+               "packed-key level geometry must end at 16 slots");
+
 typedef struct {
 #if HAS_INFINITE_H
     const PackedKey *keys;
 #else
     PackedKey *keys;
 #endif
+    size_t leveloffsets[PACKED_KEY_MAX_LEVELS];
+    size_t capacities[PACKED_KEY_MAX_LEVELS];
+    size_t levelcount;
     size_t capacity;
     size_t size;
 } PackedKeySet;
@@ -1476,62 +1490,50 @@ static inline PackedKey packedapplicationkey(PackedKey left,
     return ((PackedKey)resultbits << PACKED_KEY_LENGTH_SHIFT) | payload;
 }
 
-static inline size_t packedkeyhash(PackedKey key, size_t mask) {
-    key ^= key >> 33;
-    key *= UINT64_C(0xff51afd7ed558ccd);
-    key ^= key >> 33;
-    key *= UINT64_C(0xc4ceb9fe1a85ec53);
-    key ^= key >> 33;
-    return (size_t)key & mask;
+static inline uint64_t packedkeyprobemix(PackedKey key, uint64_t step) {
+    uint64_t mixed = key ^
+        (step * UINT64_C(0x9e3779b97f4a7c15));
+
+    mixed ^= mixed >> 30;
+    mixed *= UINT64_C(0xbf58476d1ce4e5b9);
+    mixed ^= mixed >> 27;
+    return mixed;
+}
+
+static inline uint64_t packedkeyprobemap(uint64_t level, uint64_t depth) {
+    uint64_t diagonal = level + depth;
+
+    return ((diagonal * (diagonal + 1U)) / 2U) + depth;
+}
+
+static void configurepackedkeyset(PackedKeySet *set) {
+    size_t capacity = PACKED_KEY_INITIAL_CAPACITY;
+    size_t offset = 0;
+
+    set->levelcount = 0;
+    while ((capacity > 4U) &&
+           (set->levelcount < PACKED_KEY_MAX_LEVELS)) {
+        size_t level = set->levelcount;
+
+        set->capacities[level] = capacity;
+        set->leveloffsets[level] = offset;
+        offset += capacity;
+        capacity /= 2U;
+        set->levelcount++;
+    }
+    set->capacity = offset;
 }
 
 #if !HAS_INFINITE_H
-#define INITIAL_PACKED_KEY_CAPACITY 2097152U
-_Static_assert((INITIAL_PACKED_KEY_CAPACITY &
-                (INITIAL_PACKED_KEY_CAPACITY - 1U)) == 0,
-               "initial packed-key capacity must be a power of two");
-
 static void initializepackedkeyset(PackedKeySet *set) {
-    set->keys = calloc(INITIAL_PACKED_KEY_CAPACITY,
-                       sizeof(*set->keys));
+    configurepackedkeyset(set);
+    set->keys = calloc(set->capacity, sizeof(*set->keys));
     if (set->keys == NULL) {
         fprintf(stderr, "failed to allocate packed-key set for %s\n",
                 infinitepath);
         exit(EXIT_FAILURE);
     }
-    set->capacity = INITIAL_PACKED_KEY_CAPACITY;
     set->size = 0;
-}
-
-static void growpackedkeyset(PackedKeySet *set) {
-    if ((set->capacity > (SIZE_MAX / 2U)) ||
-        ((set->capacity * 2U) > (SIZE_MAX / sizeof(*set->keys)))) {
-        fprintf(stderr, "packed-key set for %s is too large\n", infinitepath);
-        exit(EXIT_FAILURE);
-    }
-    size_t newcapacity = set->capacity * 2U;
-    PackedKey *newkeys = calloc(newcapacity, sizeof(*newkeys));
-
-    if (newkeys == NULL) {
-        fprintf(stderr, "failed to grow packed-key set for %s\n",
-                infinitepath);
-        exit(EXIT_FAILURE);
-    }
-    size_t mask = newcapacity - 1U;
-
-    for (size_t oldindex = 0; oldindex < set->capacity; ++oldindex) {
-        PackedKey key = set->keys[oldindex];
-
-        if (key == 0) continue;
-        size_t newindex = packedkeyhash(key, mask);
-        while (newkeys[newindex] != 0) {
-            newindex = (newindex + 1U) & mask;
-        }
-        newkeys[newindex] = key;
-    }
-    free(set->keys);
-    set->keys = newkeys;
-    set->capacity = newcapacity;
 }
 
 static int packedkeysetinsert(PackedKeySet *set, PackedKey key) {
@@ -1540,33 +1542,45 @@ static int packedkeysetinsert(PackedKeySet *set, PackedKey key) {
                 infinitepath);
         exit(EXIT_FAILURE);
     }
-    size_t mask = set->capacity - 1U;
-    size_t index = packedkeyhash(key, mask);
+    for (uint64_t depth = 0; depth < PACKED_KEY_PROBE_DEPTH; ++depth) {
+        for (size_t level = 0; level < set->levelcount; ++level) {
+            uint64_t sequence = packedkeyprobemap((uint64_t)level, depth);
+            size_t localindex =
+                (size_t)packedkeyprobemix(key, sequence) &
+                (set->capacities[level] - 1U);
+            size_t index = set->leveloffsets[level] + localindex;
 
-    while (set->keys[index] != 0) {
-        if (set->keys[index] == key) return 0;
-        index = (index + 1U) & mask;
+            if (set->keys[index] == key) return 0;
+            if (set->keys[index] == 0) {
+                set->keys[index] = key;
+                set->size++;
+                return 1;
+            }
+        }
     }
-    if (set->size >= (set->capacity / 2U)) {
-        growpackedkeyset(set);
-        return packedkeysetinsert(set, key);
-    }
-    set->keys[index] = key;
-    set->size++;
-    return 1;
+    fprintf(stderr,
+            "packed-key set for %s exceeded its %u-by-%zu probe space\n",
+            infinitepath, PACKED_KEY_PROBE_DEPTH, set->levelcount);
+    exit(EXIT_FAILURE);
 }
 #endif
 
 static int packedkeysetcontains(const PackedKeySet *set, PackedKey key) {
     if ((set->keys == NULL) || (key == 0)) return 0;
-    size_t mask = set->capacity - 1U;
-    size_t index = packedkeyhash(key, mask);
-    size_t start = index;
+    for (uint64_t depth = 0; depth < PACKED_KEY_PROBE_DEPTH; ++depth) {
+        for (size_t level = 0; level < set->levelcount; ++level) {
+            uint64_t sequence = packedkeyprobemap((uint64_t)level, depth);
+            size_t localindex =
+                (size_t)packedkeyprobemix(key, sequence) &
+                (set->capacities[level] - 1U);
+            size_t index = set->leveloffsets[level] + localindex;
+            PackedKey found = set->keys[index];
 
-    while (set->keys[index] != 0) {
-        if (set->keys[index] == key) return 1;
-        index = (index + 1U) & mask;
-        if (index == start) break;
+            if (found == key) return 1;
+            // There are no deletions and insertion uses the first empty
+            // candidate, so an empty slot proves that key was never inserted.
+            if (found == 0) return 0;
+        }
     }
     return 0;
 }
@@ -1575,6 +1589,7 @@ static int packedkeysetcontains(const PackedKeySet *set, PackedKey key) {
 static void destroypackedkeyset(PackedKeySet *set) {
     free(set->keys);
     set->keys = NULL;
+    set->levelcount = 0;
     set->capacity = 0;
     set->size = 0;
 }
@@ -1758,13 +1773,6 @@ static int writeinfiniteheader(void) {
     char *temppath = NULL;
     FILE *output = NULL;
 
-    if (neverendingset.size > (INITIAL_PACKED_KEY_CAPACITY / 2U)) {
-        fprintf(stderr,
-                "cannot generate infinite.h: %zu keys exceed the %u-slot "
-                "table's half-load limit\n",
-                neverendingset.size, INITIAL_PACKED_KEY_CAPACITY);
-        goto cleanup;
-    }
     if (neverendingset.size != 0U) {
         if (neverendingset.size > (SIZE_MAX / sizeof(*sorted))) {
             fprintf(stderr, "cannot generate infinite.h: key set is too large\n");
@@ -1790,18 +1798,16 @@ static int writeinfiniteheader(void) {
     if (count > 1U) {
         qsort(sorted, count, sizeof(*sorted), comparepackedkeys);
     }
-    table = calloc(INITIAL_PACKED_KEY_CAPACITY, sizeof(*table));
+    table = calloc(PACKED_KEY_TOTAL_CAPACITY, sizeof(*table));
     if (table == NULL) {
         fprintf(stderr, "failed to allocate generated infinite-key table\n");
         goto cleanup;
     }
-    size_t mask = INITIAL_PACKED_KEY_CAPACITY - 1U;
+    PackedKeySet generated = {.keys = table, .size = 0};
 
+    configurepackedkeyset(&generated);
     for (size_t i = 0; i < count; ++i) {
-        size_t index = packedkeyhash(sorted[i], mask);
-
-        while (table[index] != 0) index = (index + 1U) & mask;
-        table[index] = sorted[i];
+        (void)packedkeysetinsert(&generated, sorted[i]);
     }
     outputpath = infiniteheaderpath("");
     temppath = infiniteheaderpath(".tmp");
@@ -1838,12 +1844,16 @@ static int writeinfiniteheader(void) {
         "#ifndef __INFINITE_H_\n"
         "#define __INFINITE_H_\n\n"
         "#include <stdint.h>\n\n"
+        "#define INFINITE_KEY_INITIAL_CAPACITY %uU\n"
+        "#define INFINITE_KEY_LEVEL_COUNT %uU\n"
+        "#define INFINITE_KEY_PROBE_DEPTH %uU\n"
         "#define INFINITE_KEY_CAPACITY %uU\n"
         "#define INFINITE_KEY_COUNT %zuU\n\n"
         "static const uint64_t infinite_keys[INFINITE_KEY_CAPACITY] = {\n",
-        INITIAL_PACKED_KEY_CAPACITY, count) < 0;
+        PACKED_KEY_INITIAL_CAPACITY, PACKED_KEY_MAX_LEVELS,
+        PACKED_KEY_PROBE_DEPTH, PACKED_KEY_TOTAL_CAPACITY, count) < 0;
 
-    for (size_t i = 0; (i < INITIAL_PACKED_KEY_CAPACITY) && !failed; ++i) {
+    for (size_t i = 0; (i < PACKED_KEY_TOTAL_CAPACITY) && !failed; ++i) {
         if (table[i] == 0) continue;
         failed = fprintf(output,
                          "    [%zu] = UINT64_C(0x%016" PRIx64 "),\n",
@@ -1889,8 +1899,8 @@ static int writeinfiniteheader(void) {
         goto cleanup;
     }
 #endif
-    printf("wrote %zu packed keys in %u slots to %s\n",
-           count, INITIAL_PACKED_KEY_CAPACITY, outputpath);
+    printf("wrote %zu packed keys in %u elastic slots to %s\n",
+           count, PACKED_KEY_TOTAL_CAPACITY, outputpath);
     result = EXIT_SUCCESS;
 
 cleanup:
@@ -1902,16 +1912,22 @@ cleanup:
     return result;
 }
 #else
-_Static_assert(INFINITE_KEY_CAPACITY != 0U &&
-               (INFINITE_KEY_CAPACITY & (INFINITE_KEY_CAPACITY - 1U)) == 0U,
-               "embedded infinite-key capacity must be a power of two");
-_Static_assert(INFINITE_KEY_COUNT <= (INFINITE_KEY_CAPACITY / 2U),
-               "embedded infinite-key table must be at most half full");
+_Static_assert(INFINITE_KEY_INITIAL_CAPACITY ==
+               PACKED_KEY_INITIAL_CAPACITY,
+               "embedded infinite-key initial capacity mismatch");
+_Static_assert(INFINITE_KEY_LEVEL_COUNT == PACKED_KEY_MAX_LEVELS,
+               "embedded infinite-key level count mismatch");
+_Static_assert(INFINITE_KEY_PROBE_DEPTH == PACKED_KEY_PROBE_DEPTH,
+               "embedded infinite-key probe depth mismatch");
+_Static_assert(INFINITE_KEY_CAPACITY == PACKED_KEY_TOTAL_CAPACITY,
+               "embedded infinite-key total capacity mismatch");
+_Static_assert(INFINITE_KEY_COUNT <= INFINITE_KEY_CAPACITY,
+               "embedded infinite-key count exceeds capacity");
 
 static void readinfiniteh(void) {
     infinitepath = "infinite.h";
     neverendingset.keys = infinite_keys;
-    neverendingset.capacity = INFINITE_KEY_CAPACITY;
+    configurepackedkeyset(&neverendingset);
     neverendingset.size = INFINITE_KEY_COUNT;
 }
 #endif

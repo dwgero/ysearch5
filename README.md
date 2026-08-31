@@ -70,7 +70,10 @@ Run it with:
 ./ysearch5
 ```
 The packed-key hash table is compiled into the executable. This mode does not
-read or write `infinite.cmb` at runtime.
+read or write `infinite.cmb` at runtime. Its single contiguous array is
+divided into 16 geometrically shrinking levels, from 524,288 slots down to
+16, for 1,048,560 slots total. Insertion and lookup use the same triangularly
+mapped, mixed probe sequence across the levels.
 
 Running `ysearch5` this way took 4 seconds on a MacBook Pro M4 Max with 16 cores.
 

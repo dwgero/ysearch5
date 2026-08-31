@@ -161,7 +161,7 @@ Run the embedded version with:
 ```
 ## File-backed reuse with an existing `infinite.cmb`
 
-If a valid `infinite.cmb` already exists beside a file-backed `ysearch5`
+If a valid `infinite.cmb` already exists beside a file-backed `ysearch5-noh`
 executable, the program loads it as a read-only exact-match cache. It does not
 truncate or add to an existing catalogue. Newly discovered divergences are
 reported in the program's totals but are not appended to that preloaded file.

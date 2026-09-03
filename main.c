@@ -117,7 +117,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.7.2";
+static char version[] = "1.8.0";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -1421,47 +1421,67 @@ static int nextexpressiontoken(ExpressionTokenTraversal *traversal,
     return 0;
 }
 
-// A packed key is the exact two-bit preorder grammar in its low 58 bits,
-// with the payload width in the high six bits. Application is token zero, so
-// storing the width is what preserves leading application tokens.
-#define PACKED_KEY_LENGTH_BITS 6U
-#define PACKED_KEY_LENGTH_SHIFT (64U - PACKED_KEY_LENGTH_BITS)
-#define PACKED_KEY_PAYLOAD_BITS PACKED_KEY_LENGTH_SHIFT
-#define PACKED_KEY_PAYLOAD_MASK (UINT64_MAX >> PACKED_KEY_LENGTH_BITS)
+// A packed key is its exact two-bit preorder grammar. Application is 11, so
+// every compound expression starts with a set high bit and its integer width
+// is its grammar width. The three leaves are 00 (x), 01 (S), and 10 (K);
+// bare x is therefore the one key whose two-bit width is implicit.
+#define PACKED_KEY_BITS 64U
 #define PACKED_KEY_TOKEN_BITS 2U
-#define PACKED_TOKEN_APPLICATION UINT64_C(0)
+#define PACKED_TOKEN_X UINT64_C(0)
 #define PACKED_TOKEN_S UINT64_C(1)
 #define PACKED_TOKEN_K UINT64_C(2)
-#define PACKED_TOKEN_X UINT64_C(3)
-#define PACKED_LEAF_KEY(token) \
-    ((((PackedKey)PACKED_KEY_TOKEN_BITS) << PACKED_KEY_LENGTH_SHIFT) | \
-     (PackedKey)(token))
+#define PACKED_TOKEN_APPLICATION UINT64_C(3)
+#define PACKED_LEAF_KEY(token) ((PackedKey)(token))
 #define PACKED_KEY_S PACKED_LEAF_KEY(PACKED_TOKEN_S)
 #define PACKED_KEY_K PACKED_LEAF_KEY(PACKED_TOKEN_K)
 #define PACKED_KEY_X PACKED_LEAF_KEY(PACKED_TOKEN_X)
 
-_Static_assert(PACKED_TOKEN_APPLICATION == 0,
-               "packed application token must be zero");
-_Static_assert(((4U * MAXLEN) - 2U) <= PACKED_KEY_PAYLOAD_BITS,
+_Static_assert(PACKED_TOKEN_APPLICATION == 3,
+               "packed application token must be 11");
+_Static_assert(PACKED_TOKEN_X == 0,
+               "packed x token must be 00");
+_Static_assert(((4U * MAXLEN) - 2U) <= PACKED_KEY_BITS,
                "MAXLEN catalogue expressions must fit in packed keys");
-_Static_assert(((4U * MAXLEN) + 2U) <= PACKED_KEY_PAYLOAD_BITS,
+_Static_assert(((4U * MAXLEN) + 2U) <= PACKED_KEY_BITS,
                "MAXLEN evaluation expressions must fit in packed keys");
 
 static inline unsigned packedkeybits(PackedKey key) {
-    return (unsigned)(key >> PACKED_KEY_LENGTH_SHIFT);
+    if (key <= PACKED_KEY_K) return PACKED_KEY_TOKEN_BITS;
+#if defined(__clang__) || defined(__GNUC__)
+    return PACKED_KEY_BITS - (unsigned)__builtin_clzll(key);
+#else
+    unsigned bits = 0;
+
+    do {
+        bits++;
+        key >>= 1;
+    } while (key != 0);
+    return bits;
+#endif
 }
 
 #if PARANOID
 static int validpackedkey(PackedKey key) {
     unsigned bits = packedkeybits(key);
-    PackedKey payload = key & PACKED_KEY_PAYLOAD_MASK;
 
     if ((bits < PACKED_KEY_TOKEN_BITS) ||
-        (bits > PACKED_KEY_PAYLOAD_BITS) ||
+        (bits > PACKED_KEY_BITS) ||
         ((bits % PACKED_KEY_TOKEN_BITS) != 0)) {
         return 0;
     }
-    return (bits == PACKED_KEY_PAYLOAD_BITS) || ((payload >> bits) == 0);
+    unsigned pending = 1;
+
+    while (bits != 0) {
+        if (pending == 0) return 0;
+        unsigned token =
+            (unsigned)((key >> (bits - PACKED_KEY_TOKEN_BITS)) &
+                       UINT64_C(3));
+
+        pending--;
+        if (token == PACKED_TOKEN_APPLICATION) pending += 2;
+        bits -= PACKED_KEY_TOKEN_BITS;
+    }
+    return pending == 0;
 }
 #endif
 
@@ -1469,7 +1489,6 @@ static inline PackedKey packedapplicationkey(PackedKey left,
                                               PackedKey right) {
     unsigned leftbits = packedkeybits(left);
     unsigned rightbits = packedkeybits(right);
-    unsigned resultbits = PACKED_KEY_TOKEN_BITS + leftbits + rightbits;
 
 #if PARANOID
     if (!validpackedkey(left) || !validpackedkey(right)) {
@@ -1478,17 +1497,18 @@ static inline PackedKey packedapplicationkey(PackedKey left,
         exit(EXIT_FAILURE);
     }
 #endif
-    if (resultbits > PACKED_KEY_PAYLOAD_BITS) {
+    if ((leftbits > (PACKED_KEY_BITS - PACKED_KEY_TOKEN_BITS)) ||
+        (rightbits >
+         (PACKED_KEY_BITS - PACKED_KEY_TOKEN_BITS - leftbits))) {
         fprintf(stderr,
                 "combinator exceeds packed-key capacity of %u bits\n",
-                PACKED_KEY_PAYLOAD_BITS);
+                PACKED_KEY_BITS);
         exit(EXIT_FAILURE);
     }
-    PackedKey payload =
-        ((left & PACKED_KEY_PAYLOAD_MASK) << rightbits) |
-        (right & PACKED_KEY_PAYLOAD_MASK);
+    unsigned childrenbits = leftbits + rightbits;
 
-    return ((PackedKey)resultbits << PACKED_KEY_LENGTH_SHIFT) | payload;
+    return ((PackedKey)PACKED_TOKEN_APPLICATION << childrenbits) |
+           (left << rightbits) | right;
 }
 
 static inline uint64_t packedkeyprobemix(PackedKey key, uint64_t step) {
@@ -1646,7 +1666,7 @@ static PackedKey parsecatalogexpression(const char **position,
             unsigned resultbits = PACKED_KEY_TOKEN_BITS +
                 packedkeybits(result) + packedkeybits(term);
 
-            if (resultbits > PACKED_KEY_PAYLOAD_BITS) {
+            if (resultbits > PACKED_KEY_BITS) {
                 invalidcatalogline(linenumber,
                                    "expression exceeds packed-key capacity");
             }
@@ -1693,23 +1713,35 @@ static void loadinfinitecatalog(FILE *file) {
 
         while ((*first != '\0') && isspace(*first)) first++;
         if (*first == '*') continue;
-        if ((length < 21U) || (line[0] != '0') || (line[1] != 'x') ||
-            (line[18] != ':') || (line[19] != ' ')) {
+        if ((length < 6U) || (line[0] != '0') || (line[1] != 'x')) {
             invalidcatalogline(linenumber,
-                               "expected 0x<16 hex digits>: <SK expression>");
+                "expected 0x<1-16 hex digits>: <SK expression>");
         }
         PackedKey recordedkey = 0;
+        const char *keyend = line + 2;
+        size_t digits = 0;
 
-        for (size_t i = 2; i < 18; ++i) {
-            int digit = hexvalue((unsigned char)line[i]);
+        while (digits < 16U) {
+            int digit = hexvalue((unsigned char)*keyend);
 
-            if (digit < 0) {
-                invalidcatalogline(linenumber,
-                                   "packed key contains a non-hex digit");
-            }
+            if (digit < 0) break;
             recordedkey = (recordedkey << 4) | (PackedKey)(unsigned)digit;
+            keyend++;
+            digits++;
         }
-        const char *position = line + 20;
+        if (digits == 0) {
+            invalidcatalogline(linenumber,
+                               "packed key contains no hex digits");
+        }
+        if (hexvalue((unsigned char)*keyend) >= 0) {
+            invalidcatalogline(linenumber,
+                               "packed key exceeds 16 hex digits");
+        }
+        if ((keyend[0] != ':') || (keyend[1] != ' ')) {
+            invalidcatalogline(linenumber,
+                "expected 0x<1-16 hex digits>: <SK expression>");
+        }
+        const char *position = keyend + 2;
         PackedKey expressionkey = parsecatalogexpression(&position,
                                                           linenumber);
 
@@ -1845,19 +1877,27 @@ static int writeinfiniteheader(void) {
         "#ifndef __INFINITE_H_\n"
         "#define __INFINITE_H_\n\n"
         "#include <stdint.h>\n\n"
+        "#define INFINITE_KEY_TOKEN_BITS %uU\n"
+        "#define INFINITE_KEY_APPLICATION_TOKEN %" PRIu64 "U\n"
+        "#define INFINITE_KEY_S_TOKEN %" PRIu64 "U\n"
+        "#define INFINITE_KEY_K_TOKEN %" PRIu64 "U\n"
+        "#define INFINITE_KEY_X_TOKEN %" PRIu64 "U\n"
         "#define INFINITE_KEY_INITIAL_CAPACITY %uU\n"
         "#define INFINITE_KEY_LEVEL_COUNT %uU\n"
         "#define INFINITE_KEY_PROBE_DEPTH %uU\n"
         "#define INFINITE_KEY_CAPACITY %uU\n"
         "#define INFINITE_KEY_COUNT %zuU\n\n"
         "static const uint64_t infinite_keys[INFINITE_KEY_CAPACITY] = {\n",
-        PACKED_KEY_INITIAL_CAPACITY, PACKED_KEY_MAX_LEVELS,
+        PACKED_KEY_TOKEN_BITS, (uint64_t)PACKED_TOKEN_APPLICATION,
+        (uint64_t)PACKED_TOKEN_S, (uint64_t)PACKED_TOKEN_K,
+        (uint64_t)PACKED_TOKEN_X, PACKED_KEY_INITIAL_CAPACITY,
+        PACKED_KEY_MAX_LEVELS,
         PACKED_KEY_PROBE_DEPTH, PACKED_KEY_TOTAL_CAPACITY, count) < 0;
 
     for (size_t i = 0; (i < PACKED_KEY_TOTAL_CAPACITY) && !failed; ++i) {
         if (table[i] == 0) continue;
         failed = fprintf(output,
-                         "    [%zu] = UINT64_C(0x%016" PRIx64 "),\n",
+                         "    [%zu] = UINT64_C(0x%" PRIx64 "),\n",
                          i, (uint64_t)table[i]) < 0;
     }
     if (!failed) {
@@ -1913,6 +1953,16 @@ cleanup:
     return result;
 }
 #else
+_Static_assert(INFINITE_KEY_TOKEN_BITS == PACKED_KEY_TOKEN_BITS,
+               "embedded infinite-key token width mismatch");
+_Static_assert(INFINITE_KEY_APPLICATION_TOKEN == PACKED_TOKEN_APPLICATION,
+               "embedded infinite-key application token mismatch");
+_Static_assert(INFINITE_KEY_S_TOKEN == PACKED_TOKEN_S,
+               "embedded infinite-key S token mismatch");
+_Static_assert(INFINITE_KEY_K_TOKEN == PACKED_TOKEN_K,
+               "embedded infinite-key K token mismatch");
+_Static_assert(INFINITE_KEY_X_TOKEN == PACKED_TOKEN_X,
+               "embedded infinite-key x token mismatch");
 _Static_assert(INFINITE_KEY_INITIAL_CAPACITY ==
                PACKED_KEY_INITIAL_CAPACITY,
                "embedded infinite-key initial capacity mismatch");
@@ -1959,7 +2009,6 @@ static PackedKey cellcontentpackedkey(uint_fast32_t value) {
 static int cellsmatchpackedkey(ExpressionTokenTraversal *traversal,
                                uint_fast32_t tail, PackedKey expected) {
     unsigned remaining = packedkeybits(expected);
-    PackedKey payload = expected & PACKED_KEY_PAYLOAD_MASK;
 
     traversal->depth = 0;
     traversal->applicationsleft =
@@ -1973,7 +2022,7 @@ static int cellsmatchpackedkey(ExpressionTokenTraversal *traversal,
             return 0;
         }
         unsigned expectedtoken =
-            (unsigned)((payload >> (remaining - PACKED_KEY_TOKEN_BITS)) &
+            (unsigned)((expected >> (remaining - PACKED_KEY_TOKEN_BITS)) &
                        UINT64_C(3));
         unsigned actualtoken;
 

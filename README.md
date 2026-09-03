@@ -75,6 +75,15 @@ divided into 16 geometrically shrinking levels, from 524,288 slots down to
 16, for 1,048,560 slots total. Insertion and lookup use the same triangularly
 mapped, mixed probe sequence across the levels.
 
+Packed keys contain only the raw two-bit preorder expression: `x = 00`,
+`S = 01`, `K = 10`, and application `= 11`. There is no length field. Every
+compound expression starts with `11`, so its integer bit width recovers its
+complete encoded width; a bare leaf has an implicit width of two bits. The
+zero key for bare `x` also serves as an empty table slot, which is safe because
+the catalogue contains only closed S/K expressions `P`, never `x` itself.
+Both `infinite.h` and `infinite.cmb` print packed keys in lowercase
+hexadecimal without leading zeroes.
+
 Running `ysearch5` this way took 4 seconds on a MacBook Pro M4 Max with 16 cores.
 
 ## Create `infinite.cmb` from `infinite.h`

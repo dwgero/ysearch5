@@ -34,16 +34,14 @@
 #include <unistd.h>
 #endif
 
-#define PACKED_KEY_LENGTH_BITS 6U
-#define PACKED_KEY_LENGTH_SHIFT (64U - PACKED_KEY_LENGTH_BITS)
-#define PACKED_KEY_PAYLOAD_BITS PACKED_KEY_LENGTH_SHIFT
-#define PACKED_KEY_PAYLOAD_MASK (UINT64_MAX >> PACKED_KEY_LENGTH_BITS)
+#define PACKED_KEY_BITS 64U
 #define PACKED_KEY_TOKEN_BITS 2U
-#define PACKED_TOKEN_APPLICATION 0U
+#define PACKED_TOKEN_X 0U
 #define PACKED_TOKEN_S 1U
 #define PACKED_TOKEN_K 2U
+#define PACKED_TOKEN_APPLICATION 3U
 #define HEADER_LINE_CAPACITY 256U
-#define MAX_PACKED_NODES (PACKED_KEY_PAYLOAD_BITS / PACKED_KEY_TOKEN_BITS)
+#define MAX_PACKED_NODES (PACKED_KEY_BITS / PACKED_KEY_TOKEN_BITS)
 #define MAX_EXPRESSION_LENGTH (2U * MAX_PACKED_NODES)
 
 typedef struct {
@@ -243,6 +241,31 @@ static int parseunsigneddefine(const char *line, const char *name,
     return 1;
 }
 
+static int parseencodingdefine(const char *line, const char *path,
+                               size_t linenumber, const char *name,
+                               size_t expected, int *found)
+{
+    size_t value;
+    int status = parseunsigneddefine(line, name, &value);
+
+    if (status < 0) {
+        invalidheader(path, linenumber,
+                      "invalid packed-key encoding definition");
+    }
+    if (status > 0) {
+        if (*found) {
+            invalidheader(path, linenumber,
+                          "duplicate packed-key encoding definition");
+        }
+        if (value != expected) {
+            invalidheader(path, linenumber,
+                          "incompatible packed-key encoding definition");
+        }
+        *found = 1;
+    }
+    return status;
+}
+
 static int parsetableentry(const char *line, size_t *index, uint64_t *key)
 {
     static const char entryprefix[] = "] = UINT64_C(0x";
@@ -261,9 +284,10 @@ static int parsetableentry(const char *line, size_t *index, uint64_t *key)
         (strncmp(end, entryprefix, sizeof(entryprefix) - 1U) != 0)) return -1;
     position = end + sizeof(entryprefix) - 1U;
     uint64_t parsedkey = 0;
+    unsigned digitcount = 0;
 
-    for (unsigned i = 0; i < 16U; ++i) {
-        unsigned char character = (unsigned char)position[i];
+    for (;;) {
+        unsigned char character = (unsigned char)*position;
         unsigned digit;
 
         if ((character >= '0') && (character <= '9')) {
@@ -273,11 +297,14 @@ static int parsetableentry(const char *line, size_t *index, uint64_t *key)
         } else if ((character >= 'A') && (character <= 'F')) {
             digit = (unsigned)(character - 'A') + 10U;
         } else {
-            return -1;
+            break;
         }
+        if (digitcount == 16U) return -1;
         parsedkey = (parsedkey << 4) | digit;
+        ++digitcount;
+        ++position;
     }
-    position += 16U;
+    if (digitcount == 0U) return -1;
     if (strncmp(position, "),", 2U) != 0) return -1;
     position += 2U;
     while ((*position == ' ') || (*position == '\t') || (*position == '\r')) {
@@ -302,6 +329,11 @@ static KeyArray readheader(const char *path)
     size_t declaredcount = 0;
     int havecapacity = 0;
     int havecount = 0;
+    int havetokenbits = 0;
+    int haveapplicationtoken = 0;
+    int havestoken = 0;
+    int havektoken = 0;
+    int havextoken = 0;
     size_t previousindex = 0;
     int haveindex = 0;
 
@@ -312,6 +344,23 @@ static KeyArray readheader(const char *path)
         if ((length == 0U) || (line[length - 1U] != '\n')) {
             invalidheader(path, linenumber, "line is too long or unterminated");
         }
+        if (parseencodingdefine(line, path, linenumber,
+                                "INFINITE_KEY_TOKEN_BITS",
+                                PACKED_KEY_TOKEN_BITS,
+                                &havetokenbits) > 0) continue;
+        if (parseencodingdefine(line, path, linenumber,
+                                "INFINITE_KEY_APPLICATION_TOKEN",
+                                PACKED_TOKEN_APPLICATION,
+                                &haveapplicationtoken) > 0) continue;
+        if (parseencodingdefine(line, path, linenumber,
+                                "INFINITE_KEY_S_TOKEN", PACKED_TOKEN_S,
+                                &havestoken) > 0) continue;
+        if (parseencodingdefine(line, path, linenumber,
+                                "INFINITE_KEY_K_TOKEN", PACKED_TOKEN_K,
+                                &havektoken) > 0) continue;
+        if (parseencodingdefine(line, path, linenumber,
+                                "INFINITE_KEY_X_TOKEN", PACKED_TOKEN_X,
+                                &havextoken) > 0) continue;
         int status = parseunsigneddefine(line, "INFINITE_KEY_CAPACITY",
                                          &declaredcapacity);
         if (status < 0) invalidheader(path, linenumber, "invalid capacity");
@@ -353,6 +402,10 @@ static KeyArray readheader(const char *path)
     if (fclose(input) != 0) syserror("close", path, errno);
     if (!havecapacity) fatal("infinite.h has no INFINITE_KEY_CAPACITY");
     if (!havecount) fatal("infinite.h has no INFINITE_KEY_COUNT");
+    if (!havetokenbits || !haveapplicationtoken || !havestoken ||
+        !havektoken || !havextoken) {
+        fatal("infinite.h has no complete packed-key encoding schema");
+    }
     if (result.count != declaredcount) {
         fatal("infinite.h key count does not match its table entries");
     }
@@ -365,13 +418,27 @@ static KeyArray readheader(const char *path)
     return result;
 }
 
-static int decodenode(uint64_t payload, unsigned bits, unsigned *offset,
+static unsigned packedkeybits(uint64_t key)
+{
+    if (key <= PACKED_TOKEN_K) {
+        return PACKED_KEY_TOKEN_BITS;
+    }
+    unsigned bits = 0;
+
+    while (key != 0) {
+        ++bits;
+        key >>= 1;
+    }
+    return bits;
+}
+
+static int decodenode(uint64_t key, unsigned bits, unsigned *offset,
                       Node *nodes, unsigned *nodecount)
 {
     if ((*offset + PACKED_KEY_TOKEN_BITS) > bits ||
         *nodecount >= MAX_PACKED_NODES) return -1;
     unsigned shift = bits - *offset - PACKED_KEY_TOKEN_BITS;
-    unsigned token = (unsigned)((payload >> shift) & UINT64_C(3));
+    unsigned token = (unsigned)((key >> shift) & UINT64_C(3));
     int index = (int)(*nodecount);
 
     ++*nodecount;
@@ -380,9 +447,9 @@ static int decodenode(uint64_t payload, unsigned bits, unsigned *offset,
     nodes[index].left = -1;
     nodes[index].right = -1;
     if (token == PACKED_TOKEN_APPLICATION) {
-        nodes[index].left = decodenode(payload, bits, offset, nodes,
+        nodes[index].left = decodenode(key, bits, offset, nodes,
                                        nodecount);
-        nodes[index].right = decodenode(payload, bits, offset, nodes,
+        nodes[index].right = decodenode(key, bits, offset, nodes,
                                         nodecount);
         if ((nodes[index].left < 0) || (nodes[index].right < 0)) return -1;
     } else if ((token != PACKED_TOKEN_S) && (token != PACKED_TOKEN_K)) {
@@ -428,19 +495,22 @@ static int renderexpression(const Node *nodes, int node, char *output,
 static void keytoexpression(uint64_t key,
                             char output[MAX_EXPRESSION_LENGTH + 1U])
 {
-    unsigned bits = (unsigned)(key >> PACKED_KEY_LENGTH_SHIFT);
-    uint64_t payload = key & PACKED_KEY_PAYLOAD_MASK;
+    unsigned bits = packedkeybits(key);
 
     if ((bits < PACKED_KEY_TOKEN_BITS) ||
-        (bits > PACKED_KEY_PAYLOAD_BITS) ||
-        ((bits % PACKED_KEY_TOKEN_BITS) != 0U) ||
-        ((bits < PACKED_KEY_PAYLOAD_BITS) && ((payload >> bits) != 0U))) {
+        (bits > PACKED_KEY_BITS) ||
+        ((bits % PACKED_KEY_TOKEN_BITS) != 0U)) {
         fatal("infinite.h contains an invalid packed-key width");
+    }
+    if ((bits > PACKED_KEY_TOKEN_BITS) &&
+        (((key >> (bits - PACKED_KEY_TOKEN_BITS)) & UINT64_C(3)) !=
+         PACKED_TOKEN_APPLICATION)) {
+        fatal("infinite.h contains an invalid packed expression tree");
     }
     Node nodes[MAX_PACKED_NODES];
     unsigned offset = 0;
     unsigned nodecount = 0;
-    int root = decodenode(payload, bits, &offset, nodes, &nodecount);
+    int root = decodenode(key, bits, &offset, nodes, &nodecount);
 
     if ((root < 0) || (offset != bits)) {
         fatal("infinite.h contains an invalid packed expression tree");
@@ -486,7 +556,7 @@ static void writecatalog(const char *path, const char *temppath,
         char expression[MAX_EXPRESSION_LENGTH + 1U];
 
         keytoexpression(array->keys[i], expression);
-        failed = fprintf(output, "0x%016" PRIx64 ": %s\n",
+        failed = fprintf(output, "0x%" PRIx64 ": %s\n",
                          array->keys[i], expression) < 0;
     }
     int writeerror = errno ? errno : EIO;

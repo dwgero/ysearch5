@@ -117,7 +117,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.9.0";
+static char version[] = "1.10.0";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -315,6 +315,7 @@ static void initializepackedkeyset(PackedKeySet *set);
 static int packedkeysetinsert(PackedKeySet *set, PackedKey key);
 static void loadinfinitecatalog(FILE *file);
 static void destroypackedkeyset(PackedKeySet *set);
+static int writeinfinitecatalog(uint32_t count);
 static int writeinfiniteheader(void);
 #endif
 
@@ -583,17 +584,19 @@ static int closeinfinitecatalog(void)
     // All workers have joined, so every reserved array entry is now written.
     uint32_t count =
         atomic_load_explicit(&newneverendingcount, memory_order_relaxed);
-    if ((count != 0) && (neverendingset.keys == NULL)) {
-        initializepackedkeyset(&neverendingset);
-    }
-    for (uint32_t i = 0; i < count; ++i) {
-        (void)packedkeysetinsert(&neverendingset, newneverendingkeys[i]);
+    int result = EXIT_SUCCESS;
+    if (neverendingset.keys == NULL) {
+        result = writeinfinitecatalog(count);
+    } else {
+        for (uint32_t i = 0; i < count; ++i) {
+            (void)packedkeysetinsert(&neverendingset, newneverendingkeys[i]);
+        }
     }
     free(newneverendingkeys);
     newneverendingkeys = NULL;
     newneverendingcapacity = 0;
     atomic_store_explicit(&newneverendingcount, 0, memory_order_relaxed);
-    int result = writeinfiniteheader();
+    if (neverendingset.keys != NULL) result = writeinfiniteheader();
 
     destroypackedkeyset(&neverendingset);
     free(infinitepath);
@@ -1786,14 +1789,7 @@ static void loadinfinitecatalog(FILE *file) {
     }
 }
 
-static int comparepackedkeys(const void *first, const void *second) {
-    PackedKey a = *(const PackedKey *)first;
-    PackedKey b = *(const PackedKey *)second;
-
-    return (a > b) - (a < b);
-}
-
-static char *infiniteheaderpath(const char *suffix) {
+static char *infiniteoutputpath(const char *filename, const char *suffix) {
     const char *separator = strrchr(infinitepath, '/');
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -1807,72 +1803,176 @@ static char *infiniteheaderpath(const char *suffix) {
     size_t directorylength = (separator == NULL)
         ? 0U
         : (size_t)(separator - infinitepath) + 1U;
-    static const char filename[] = "infinite.h";
+    size_t filenamelength = strlen(filename) + 1U;
     size_t suffixlength = strlen(suffix);
 
-    if (directorylength > (SIZE_MAX - sizeof(filename) - suffixlength)) {
-        fprintf(stderr, "infinite.h path is too long\n");
+    if ((suffixlength > (SIZE_MAX - filenamelength)) ||
+        (directorylength > (SIZE_MAX - filenamelength - suffixlength))) {
+        fprintf(stderr, "%s path is too long\n", filename);
         return NULL;
     }
-    char *path = malloc(directorylength + sizeof(filename) + suffixlength);
+    char *path = malloc(directorylength + filenamelength + suffixlength);
 
     if (path == NULL) {
-        fprintf(stderr, "failed to allocate infinite.h path\n");
+        fprintf(stderr, "failed to allocate %s path\n", filename);
         return NULL;
     }
     memcpy(path, infinitepath, directorylength);
-    memcpy(path + directorylength, filename, sizeof(filename) - 1U);
-    memcpy(path + directorylength + sizeof(filename) - 1U,
+    memcpy(path + directorylength, filename, filenamelength - 1U);
+    memcpy(path + directorylength + filenamelength - 1U,
            suffix, suffixlength + 1U);
     return path;
 }
 
+#define CATALOG_EXPRESSION_CAPACITY (PACKED_KEY_BITS + 1U)
+
+static int appendcataloguecharacter(char *buffer, size_t *length,
+                                    char character) {
+    if (*length >= CATALOG_EXPRESSION_CAPACITY - 1U) return 0;
+    buffer[(*length)++] = character;
+    return 1;
+}
+
+// As in makeinfcmb, flatten left applications and parenthesize right ones.
+// Each recursive call consumes a token, bounding depth by the packed width.
+static int decodecatalogueexpression(PackedKey key, unsigned *remaining,
+                                     int rightterm, char *buffer,
+                                     size_t *length) {
+    if (*remaining < PACKED_KEY_TOKEN_BITS) return 0;
+    *remaining -= PACKED_KEY_TOKEN_BITS;
+    unsigned token = (unsigned)((key >> *remaining) & UINT64_C(3));
+
+    if (token == PACKED_TOKEN_S || token == PACKED_TOKEN_K) {
+        return appendcataloguecharacter(buffer, length,
+                                         token == PACKED_TOKEN_S ? 'S' : 'K');
+    }
+    if (token != PACKED_TOKEN_APPLICATION) return 0;
+    if (rightterm && !appendcataloguecharacter(buffer, length, '(')) return 0;
+    if (!decodecatalogueexpression(key, remaining, 0, buffer, length) ||
+        !decodecatalogueexpression(key, remaining, 1, buffer, length)) return 0;
+    return !rightterm || appendcataloguecharacter(buffer, length, ')');
+}
+
+static int packedkeytocatalogueexpression(PackedKey key, char *buffer) {
+    unsigned remaining = packedkeybits(key);
+    size_t length = 0;
+
+    if ((remaining % PACKED_KEY_TOKEN_BITS) != 0U ||
+        !decodecatalogueexpression(key, &remaining, 0, buffer, &length) ||
+        remaining != 0U) return 0;
+    buffer[length] = '\0';
+    return 1;
+}
+
+static int writeinfinitecatalog(uint32_t count) {
+    int result = EXIT_FAILURE;
+    int outputcreated = 0;
+    FILE *output = NULL;
+    char *temppath = infiniteoutputpath("infinite.cmb", ".tmp");
+
+    if (temppath == NULL) return EXIT_FAILURE;
+    errno = 0;
+    output = fopen(temppath, "w");
+    if (output == NULL) {
+        int error = errno ? errno : EIO;
+
+        fprintf(stderr, "failed to open %s: %s\n", temppath, strerror(error));
+        goto cleanup;
+    }
+    outputcreated = 1;
+    errno = 0;
+    if (fprintf(output,
+        "* Generated by ysearch5 from its new divergent keys. Do not edit.\n"
+        "*\n"
+        "* infinite.cmb\n"
+        "* Part of ysearch5\n"
+        "* Copyright (C) 2026 by David W. Gero\n"
+        "*\n"
+        "* This program is free software: you can redistribute it and/or modify\n"
+        "* it under the terms of the GNU General Public License as published by\n"
+        "* the Free Software Foundation, either version 3 of the License, or\n"
+        "* (at your option) any later version.\n"
+        "*\n"
+        "* This program is distributed in the hope that it will be useful,\n"
+        "* but WITHOUT ANY WARRANTY; without even the implied warranty of\n"
+        "* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n"
+        "* GNU General Public License for more details.\n"
+        "*\n"
+        "* You should have received a copy of the GNU General Public License\n"
+        "* along with this program.  If not, see <http://www.gnu.org/licenses/>.\n"
+        "*\n") < 0) goto writefailed;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        PackedKey key = newneverendingkeys[i];
+        char expression[CATALOG_EXPRESSION_CAPACITY];
+
+        if (!packedkeytocatalogueexpression(key, expression)) {
+            fprintf(stderr, "cannot write %s: invalid packed key 0x%" PRIx64 "\n",
+                    infinitepath, (uint64_t)key);
+            goto cleanup;
+        }
+        if (fprintf(output, "0x%" PRIx64 ": %s\n", (uint64_t)key,
+                    expression) < 0) goto writefailed;
+    }
+    errno = 0;
+    if (fclose(output) != 0) {
+        output = NULL;
+        goto writefailed;
+    }
+    output = NULL;
+#if defined(_WIN32) || defined(_WIN64)
+    if (!MoveFileExA(temppath, infinitepath,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DWORD error = GetLastError();
+
+        fprintf(stderr, "failed to replace %s with error %lu\n",
+                infinitepath, (unsigned long)error);
+        goto cleanup;
+    }
+#else
+    errno = 0;
+    if (rename(temppath, infinitepath) != 0) {
+        int error = errno ? errno : EIO;
+
+        fprintf(stderr, "failed to replace %s: %s\n", infinitepath,
+                strerror(error));
+        goto cleanup;
+    }
+#endif
+    printf("wrote %" PRIu32 " packed-key records to %s\n", count, infinitepath);
+    result = EXIT_SUCCESS;
+    goto cleanup;
+
+writefailed: {
+    int error = errno ? errno : EIO;
+
+    fprintf(stderr, "failed to write %s: %s\n", infinitepath, strerror(error));
+}
+cleanup:
+    if (output != NULL) (void)fclose(output);
+    if ((result != EXIT_SUCCESS) && outputcreated) (void)remove(temppath);
+    free(temppath);
+    return result;
+}
+
 static int writeinfiniteheader(void) {
     int result = EXIT_FAILURE;
-    PackedKey *sorted = NULL;
-    PackedKey *table = NULL;
     char *outputpath = NULL;
     char *temppath = NULL;
     FILE *output = NULL;
-
-    if (neverendingset.size != 0U) {
-        if (neverendingset.size > (SIZE_MAX / sizeof(*sorted))) {
-            fprintf(stderr, "cannot generate infinite.h: key set is too large\n");
-            goto cleanup;
-        }
-        sorted = malloc(neverendingset.size * sizeof(*sorted));
-        if (sorted == NULL) {
-            fprintf(stderr, "failed to allocate sorted infinite-key array\n");
-            goto cleanup;
-        }
-    }
     size_t count = 0;
 
+    // The startup table already contains the merged discoveries. Preserve
+    // its slots directly, without sorting or allocating another key buffer.
     for (size_t i = 0; i < neverendingset.capacity; ++i) {
-        PackedKey key = neverendingset.keys[i];
-
-        if (key != 0) sorted[count++] = key;
+        if (neverendingset.keys[i] != 0) count++;
     }
     if (count != neverendingset.size) {
         fprintf(stderr, "cannot generate infinite.h: key-set size mismatch\n");
         goto cleanup;
     }
-    if (count > 1U) {
-        qsort(sorted, count, sizeof(*sorted), comparepackedkeys);
-    }
-    table = calloc(PACKED_KEY_TOTAL_CAPACITY, sizeof(*table));
-    if (table == NULL) {
-        fprintf(stderr, "failed to allocate generated infinite-key table\n");
-        goto cleanup;
-    }
-    PackedKeySet generated = {.keys = table, .size = 0};
-
-    configurepackedkeyset(&generated);
-    for (size_t i = 0; i < count; ++i) {
-        (void)packedkeysetinsert(&generated, sorted[i]);
-    }
-    outputpath = infiniteheaderpath("");
-    temppath = infiniteheaderpath(".tmp");
+    outputpath = infiniteoutputpath("infinite.h", "");
+    temppath = infiniteoutputpath("infinite.h", ".tmp");
     if ((outputpath == NULL) || (temppath == NULL)) goto cleanup;
     errno = 0;
     output = fopen(temppath, "w");
@@ -1923,11 +2023,11 @@ static int writeinfiniteheader(void) {
         PACKED_KEY_MAX_LEVELS,
         PACKED_KEY_PROBE_DEPTH, PACKED_KEY_TOTAL_CAPACITY, count) < 0;
 
-    for (size_t i = 0; (i < PACKED_KEY_TOTAL_CAPACITY) && !failed; ++i) {
-        if (table[i] == 0) continue;
+    for (size_t i = 0; (i < neverendingset.capacity) && !failed; ++i) {
+        if (neverendingset.keys[i] == 0) continue;
         failed = fprintf(output,
                          "    [%zu] = UINT64_C(0x%" PRIx64 "),\n",
-                         i, (uint64_t)table[i]) < 0;
+                         i, (uint64_t)neverendingset.keys[i]) < 0;
     }
     if (!failed) {
         failed = fprintf(output,
@@ -1977,8 +2077,6 @@ cleanup:
     if (output != NULL) (void)fclose(output);
     free(temppath);
     free(outputpath);
-    free(table);
-    free(sorted);
     return result;
 }
 #else

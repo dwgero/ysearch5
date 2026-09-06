@@ -42,8 +42,11 @@ mathematical divergence.
 An existing `infinite.cmb` can seed the search with divergent and
 resource-exhausted candidates. Catalogue lookups are exact
 complete-expression matches, never prefix or nested-subexpression matches.
-New classifications are retained in memory and written to `infinite.h` at
-successful shutdown; `main.c` never creates or modifies `infinite.cmb`.
+New classifications are retained in memory. If `infinite.cmb` was absent at
+startup, successful shutdown creates it directly from the append array for
+later conversion by `makeinfh`. If a catalogue was loaded, it remains
+read-only and shutdown writes `infinite.h` from the union of loaded and new
+keys.
 
 ## Requirements
 
@@ -139,10 +142,15 @@ xcrun clang \
 ./build/ysearch5-noh
 ```
 Because no catalogue exists, the program retains each newly classified
-divergent key in memory. It does not create `build/infinite.cmb`. At successful
-shutdown it constructs the complete hash table and atomically creates
-`build/infinite.h`. If the run is interrupted or crashes, no partial header
-replaces an existing `build/infinite.h`.
+divergent key in a 5 MiB append-only array, without allocating or consulting a
+lookup table. At successful shutdown it writes the array directly to
+`build/infinite.cmb`, using `0x<packed-key>: <SK expression>` records. The file
+is published atomically only after the complete catalogue is written;
+`build/infinite.h` is left untouched. No second key array or hash table is
+allocated during this export.
+
+Records remain in discovery order, which can vary between multithreaded
+runs. Duplicates, if any, are left for `makeinfh` to remove during conversion.
 
 Catalogues are specific to the evaluator semantics and configured resource
 ceilings; the file format does not carry a version or those limits. To
@@ -153,7 +161,25 @@ Running the uncached `ysearch5-noh` search took 33 minutes on a MacBook Pro M4
 Max with 16 cores. Running it with the complete existing `infinite.cmb` cache
 took 5 seconds.
 
-### 4. Compile the embedded-catalogue search
+### 4. Convert the catalogue to `infinite.h`
+
+After `ysearch5-noh` exits, compile and run the separate `makeinfh.c`
+converter included in this repository:
+```sh
+xcrun clang \
+  -std=c11 -O3 -march=native -DNDEBUG \
+  -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror \
+  makeinfh.c -o build/makeinfh
+./build/makeinfh
+```
+`makeinfh` reads `build/infinite.cmb`, validates each record, and inserts it
+directly into one approximately 8 MiB hash table, ignoring duplicate keys.
+It then atomically writes that table to `build/infinite.h`. Input order can
+affect hash-slot placement, but not the stored key set or lookup behavior.
+If the search finds no divergences, it creates a comment-only catalogue;
+the converter currently rejects such an empty catalogue.
+
+### 5. Compile the embedded-catalogue search
 
 The generated header is in `build`, so add that directory to the include
 path:
@@ -171,11 +197,23 @@ Run the embedded version with:
 ## File-backed reuse with an existing `infinite.cmb`
 
 If a valid `infinite.cmb` already exists beside a file-backed `ysearch5-noh`
-executable, the program loads it as a read-only exact-match cache. It does not
-truncate or add to an existing catalogue. Newly discovered divergences are
-reported in the program's totals but are not appended to that preloaded file.
-At successful shutdown it atomically creates or replaces `infinite.h` beside
-the executable from the union of the preloaded and newly classified keys.
+executable, the program allocates one approximately 8 MiB hash table and
+inserts each validated catalogue entry directly into it. Duplicate keys count
+once. With `N` unique loaded keys, it allocates an append-only array of
+`655360 - N` 64-bit entries. During search the table is a read-only exact-match
+cache, and newly discovered divergences go into the append array.
+
+After all workers finish, the program inserts the array entries into that
+same hash table, frees the array, and atomically creates or replaces
+`infinite.h` beside the executable by writing the table's occupied slots
+directly. It does not sort keys or allocate a second hash table. Input and
+discovery order can affect slot placement, but not the stored key set or
+lookup behavior.
+
+The original `infinite.cmb` remains untouched. With the current 600,907-key
+catalogue, key buffers peak at about 8.415 MiB during search and merging,
+then fall to approximately 8 MiB for header output. These sizes exclude
+evaluator memory and runtime overhead.
 
 ## Parallelism and limits
 

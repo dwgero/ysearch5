@@ -34,6 +34,8 @@
 #include <unistd.h>
 #endif
 
+static const char version[] = "1.10.0";
+
 #define PACKED_KEY_BITS 64U
 #define PACKED_KEY_TOKEN_BITS 2U
 #define PACKED_TOKEN_X 0U
@@ -594,6 +596,10 @@ static void writecatalog(const char *path, const char *temppath,
 int main(int argc, char **argv)
 {
     (void)argc;
+
+    printf("makeinfcmb Version %s\n", version);
+    fflush(stdout);
+
     char *executable = getexecutablepath(argv[0]);
     char *inputpath = adjacentpath(executable, "infinite.h");
     char *outputpath = adjacentpath(executable, "infinite.cmb");

@@ -117,7 +117,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.8.0";
+static char version[] = "1.9.0";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -228,9 +228,6 @@ char bufmaxlen[MAXBUF + 1];
 
 pthread_mutex_t printlock = PTHREAD_MUTEX_INITIALIZER;
 
-#if !HAS_INFINITE_H
-pthread_mutex_t neverendingsetlock = PTHREAD_MUTEX_INITIALIZER;
-#endif
 char *infinitepath;
 
 // Allocator state changes on every cell allocation/free. Keep it private to
@@ -310,7 +307,10 @@ typedef struct {
 
 static PackedKeySet neverendingset;
 #if !HAS_INFINITE_H
-static PackedKeySet newneverendingset;
+#define NEVERENDING_KEY_BUDGET ((512U + 128U) * 1024U)
+static PackedKey *newneverendingkeys;
+static uint32_t newneverendingcapacity;
+static _Atomic(uint32_t) newneverendingcount = 0;
 static void initializepackedkeyset(PackedKeySet *set);
 static int packedkeysetinsert(PackedKeySet *set, PackedKey key);
 static void loadinfinitecatalog(FILE *file);
@@ -496,6 +496,28 @@ static char *getexecutablepath(const char *argv0)
 #endif
 }
 
+static void initializenewneverendings(void)
+{
+    if (neverendingset.size > NEVERENDING_KEY_BUDGET) {
+        fprintf(stderr, "catalogue %s has %zu keys, exceeding the %u-key budget\n",
+                infinitepath, neverendingset.size, NEVERENDING_KEY_BUDGET);
+        exit(EXIT_FAILURE);
+    }
+    newneverendingcapacity =
+        NEVERENDING_KEY_BUDGET - (uint32_t)neverendingset.size;
+    newneverendingkeys = NULL;
+    atomic_store_explicit(&newneverendingcount, 0, memory_order_relaxed);
+    if (newneverendingcapacity == 0) return;
+
+    newneverendingkeys =
+        malloc(newneverendingcapacity * sizeof(*newneverendingkeys));
+    if (newneverendingkeys == NULL) {
+        fprintf(stderr, "failed to allocate new-divergence array for %s\n",
+                infinitepath);
+        exit(EXIT_FAILURE);
+    }
+}
+
 static void initializeinfinitecatalog(const char *argv0)
 {
     static const char filename[] = "infinite.cmb";
@@ -542,7 +564,7 @@ static void initializeinfinitecatalog(const char *argv0)
                     infinitepath, strerror(error));
             exit(EXIT_FAILURE);
         }
-        initializepackedkeyset(&newneverendingset);
+        initializenewneverendings();
         return;
     }
     int error = errno;
@@ -552,18 +574,25 @@ static void initializeinfinitecatalog(const char *argv0)
                 infinitepath, strerror(error ? error : EIO));
         exit(EXIT_FAILURE);
     }
-    initializepackedkeyset(&neverendingset);
-    initializepackedkeyset(&newneverendingset);
+    // No seed: leave the startup lookup set empty and unallocated.
+    initializenewneverendings();
 }
 
 static int closeinfinitecatalog(void)
 {
-    for (size_t i = 0; i < newneverendingset.capacity; ++i) {
-        PackedKey key = newneverendingset.keys[i];
-
-        if (key != 0) (void)packedkeysetinsert(&neverendingset, key);
+    // All workers have joined, so every reserved array entry is now written.
+    uint32_t count =
+        atomic_load_explicit(&newneverendingcount, memory_order_relaxed);
+    if ((count != 0) && (neverendingset.keys == NULL)) {
+        initializepackedkeyset(&neverendingset);
     }
-    destroypackedkeyset(&newneverendingset);
+    for (uint32_t i = 0; i < count; ++i) {
+        (void)packedkeysetinsert(&neverendingset, newneverendingkeys[i]);
+    }
+    free(newneverendingkeys);
+    newneverendingkeys = NULL;
+    newneverendingcapacity = 0;
+    atomic_store_explicit(&newneverendingcount, 0, memory_order_relaxed);
     int result = writeinfiniteheader();
 
     destroypackedkeyset(&neverendingset);
@@ -2077,9 +2106,20 @@ static void recordinfinitecombinator(uint_fast32_t bufferhead,
     }
     PackedKey key = cells2packedkeywithoutfinal(bufferhead);
 
-    pthread_mutex_lock(&neverendingsetlock);
-    (void)packedkeysetinsert(&newneverendingset, key);
-    pthread_mutex_unlock(&neverendingsetlock);
+    if (key == 0) {
+        fprintf(stderr, "cannot record an empty packed key from %s\n",
+                infinitepath);
+        exit(EXIT_FAILURE);
+    }
+    // Reserve a private slot; publication is provided by the worker joins.
+    uint32_t index = atomic_fetch_add_explicit(&newneverendingcount, 1,
+                                               memory_order_relaxed);
+    if (index >= newneverendingcapacity) {
+        fprintf(stderr, "new-divergence array for %s exceeded %" PRIu32 " entries\n",
+                infinitepath, newneverendingcapacity);
+        exit(EXIT_FAILURE);
+    }
+    newneverendingkeys[index] = key;
 }
 #endif
 
@@ -3490,6 +3530,7 @@ void generateallSK(unsigned length, uint_fast32_t num, char *buffer) {
                                count, 1)) {
             continue;
         }
+        // An empty startup set skips both key packing and cache lookup.
         if ((neverendingset.size != 0) &&
             packedkeysetcontains(
                 &neverendingset,

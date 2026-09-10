@@ -35,7 +35,7 @@
 #include <unistd.h>
 #endif
 
-static const char version[] = "1.11.0";
+static const char version[] = "1.11.1";
 
 #define PACKED_KEY_TOKEN_BITS 2U
 #define PACKED_KEY_BITS 64U
@@ -455,15 +455,11 @@ static void writeheader(const char *outputpath, const char *temppath,
 
     // C11 needs an initializer even when the table has no keys.
     if (!failed && table->count == 0U) failed = fprintf(output, "    0,\n") < 0;
-    for (size_t i = 0; (i < INFINITE_KEY_CAPACITY) && !failed; ++i) {
+    for (size_t i = 0; (i <= INFINITE_KEY_CAPACITY) && !failed; ++i) {
         if (table->keys[i] == 0) continue;
         failed = fprintf(output,
                          "    [%zu] = UINT64_C(0x%" PRIx64 "),\n",
                          i, table->keys[i]) < 0;
-    }
-    if (!failed && cuckoocontains(table->keys, 0)) {
-        failed = fprintf(output, "    [%u] = UINT64_C(0x1),\n",
-                         INFINITE_KEY_CAPACITY) < 0;
     }
     if (!failed) {
         failed = fprintf(output,

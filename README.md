@@ -75,7 +75,7 @@ Run it with:
 The packed-key hash table is compiled into the executable. This mode does not
 read or write `infinite.cmb` at runtime. Its single contiguous array is
 divided into 163,840 aligned four-key buckets, for 655,360 hashed slots,
-plus one extra bucket for zero-key presence (5,242,912 bytes: 5 MiB + 32 bytes).
+plus one extra bucket for zero-key presence (5,242,912 bytes: ~5 MiB).
 Blocked cuckoo hashing gives each complete
 key two candidate buckets; lookup checks at most eight full 64-bit keys, not
 fingerprints. There are no probabilistic matches. The shared `cuckoo.h`
@@ -85,15 +85,12 @@ The table uses two seeded MurmurHash3 finalizer
 hashes and fills the first bucket before the second. When both buckets are
 full, insertion evicts a key and tries its alternate bucket, for at most
 160 kicks. A 640-byte temporary stack journal reverses every swap if the limit
-is reached, leaving the table unchanged and reporting an error. The sample's
-50-kick limit is insufficient for the full 600,907-key catalogue, which
-occupies about 91.69% of the hashed slots.
+is reached, leaving the table unchanged and reporting an error.
 
 Insertion assumes tables are built through this API without deletions:
 occupied slots form a prefix in each bucket, and a key in its second bucket
 has a full first bucket. This permits returning at the first empty slot
-without missing duplicates. Arbitrarily populated tables with holes do not
-satisfy this insertion contract.
+without missing duplicates.
 
 This is hash-layout version 2. Headers from the previous cuckoo hashes or
 the old elastic layout or previous capacity must be regenerated; incompatible
@@ -185,7 +182,7 @@ with no `infinite.cmb` beside it.
 
 Running the uncached `ysearch5-noh` search took 33 minutes on a MacBook Pro M4
 Max with 16 cores. Running it with the complete existing `infinite.cmb` cache
-took 5 seconds.
+took 4 seconds.
 
 ### 4. Convert the catalogue to `infinite.h`
 
@@ -199,7 +196,7 @@ xcrun clang \
 ./build/makeinfh
 ```
 `makeinfh` reads `build/infinite.cmb`, validates each record, and inserts it
-directly into one 5 MiB + 32-byte blocked cuckoo table, ignoring
+directly into one 5 MiB blocked cuckoo table, ignoring
 duplicate keys.
 It then atomically writes that table to `build/infinite.h`. Input order can
 affect hash-slot placement, but not the stored key set or lookup behavior.
@@ -225,7 +222,7 @@ Run the embedded version with:
 ## File-backed reuse with an existing `infinite.cmb`
 
 If a valid `infinite.cmb` already exists beside a file-backed `ysearch5-noh`
-executable, the program allocates one 5 MiB + 32-byte hash table and
+executable, the program allocates one 5 MiB hash table and
 inserts each validated catalogue entry directly into it. Duplicate keys count
 once. With `N` unique loaded keys, it allocates an append-only array of
 `655360 - N` 64-bit entries. During search the table is a read-only exact-match
@@ -240,7 +237,7 @@ lookup behavior.
 
 The original `infinite.cmb` remains untouched. With the current 600,907-key
 catalogue, key buffers peak at about 5.415 MiB during search and merging,
-then fall to 5 MiB + 32 bytes for header output. These sizes exclude
+then fall to about 5 MiB for header output. These sizes exclude
 relocation scratch, evaluator memory, and runtime overhead.
 
 The append-array budget remains 655,360 entries, equal to the number of hashed
@@ -256,7 +253,7 @@ limits, and step limits are compile-time constants near the top of `main.c`.
 
 ## Hash-table regression tests
 
-Run `tests/test-cuckoo.sh` with the complete current 600,907-key `infinite.cmb`
+Run `sh tests/test-cuckoo.sh` with the complete current 600,907-key `infinite.cmb`
 in the repository root, or pass its path as the first argument. The tests
 use Clang (or `CC`) with AddressSanitizer and UndefinedBehaviorSanitizer to
 check allocation, seven insertion orders, exact lookup, duplicate handling,

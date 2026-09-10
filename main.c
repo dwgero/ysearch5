@@ -118,7 +118,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.11.0";
+static char version[] = "1.11.1";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -1932,12 +1932,11 @@ static int writeinfiniteheader(void) {
     char *outputpath = NULL;
     char *temppath = NULL;
     FILE *output = NULL;
-    unsigned haszero = cuckoocontains(neverendingset.keys, 0) != 0;
-    size_t count = haszero;
+    size_t count = 0;
 
     // The startup table already contains the merged discoveries. Preserve
     // its slots directly, without sorting or allocating another key buffer.
-    for (size_t i = 0; i < neverendingset.capacity; ++i) {
+    for (size_t i = 0; i <= neverendingset.capacity; ++i) {
         if (neverendingset.keys[i] != 0) count++;
     }
     if (count != neverendingset.size) {
@@ -2000,15 +1999,11 @@ static int writeinfiniteheader(void) {
 
     // C11 needs an initializer even when there are no designated key entries.
     if (!failed && count == 0U) failed = fprintf(output, "    0,\n") < 0;
-    for (size_t i = 0; (i < neverendingset.capacity) && !failed; ++i) {
+    for (size_t i = 0; (i <= neverendingset.capacity) && !failed; ++i) {
         if (neverendingset.keys[i] == 0) continue;
         failed = fprintf(output,
                          "    [%zu] = UINT64_C(0x%" PRIx64 "),\n",
                          i, (uint64_t)neverendingset.keys[i]) < 0;
-    }
-    if (!failed && haszero) {
-        failed = fprintf(output, "    [%u] = UINT64_C(0x1),\n",
-                         PACKED_KEY_TOTAL_CAPACITY) < 0;
     }
     if (!failed) {
         failed = fprintf(output,

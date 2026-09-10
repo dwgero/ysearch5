@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "cuckoo.h"
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -34,7 +35,7 @@
 #include <unistd.h>
 #endif
 
-static const char version[] = "1.10.0";
+static const char version[] = "1.11.0";
 
 #define PACKED_KEY_TOKEN_BITS 2U
 #define PACKED_KEY_BITS 64U
@@ -45,23 +46,11 @@ static const char version[] = "1.10.0";
 #define PACKED_KEY_S ((uint64_t)PACKED_TOKEN_S)
 #define PACKED_KEY_K ((uint64_t)PACKED_TOKEN_K)
 #define CATALOG_LINE_CAPACITY 128U
-#define INFINITE_KEY_INITIAL_CAPACITY (512U * 1024U)
-#define INFINITE_KEY_LEVEL_COUNT 16U
-#define INFINITE_KEY_PROBE_DEPTH 32U
-#define INFINITE_KEY_CAPACITY ((2U * INFINITE_KEY_INITIAL_CAPACITY) - 16U)
-
-_Static_assert((INFINITE_KEY_INITIAL_CAPACITY &
-                (INFINITE_KEY_INITIAL_CAPACITY - 1U)) == 0U,
-               "initial infinite-key capacity must be a power of two");
-_Static_assert((INFINITE_KEY_INITIAL_CAPACITY >>
-                (INFINITE_KEY_LEVEL_COUNT - 1U)) == 16U,
-               "infinite-key level geometry must end at 16 slots");
+#define INFINITE_KEY_CAPACITY CUCKOO_SLOT_COUNT
 
 typedef struct {
     uint64_t *keys;
     size_t count;
-    size_t capacities[INFINITE_KEY_LEVEL_COUNT];
-    size_t offsets[INFINITE_KEY_LEVEL_COUNT];
 } KeyTable;
 
 _Noreturn static void fatal(const char *message)
@@ -297,39 +286,11 @@ static uint64_t parseexpression(const char **position,
     return result;
 }
 
-static uint64_t packedkeyprobemix(uint64_t key, uint64_t step)
-{
-    uint64_t mixed = key ^
-        (step * UINT64_C(0x9e3779b97f4a7c15));
-
-    mixed ^= mixed >> 30;
-    mixed *= UINT64_C(0xbf58476d1ce4e5b9);
-    mixed ^= mixed >> 27;
-    return mixed;
-}
-
-static uint64_t packedkeyprobemap(uint64_t level, uint64_t depth)
-{
-    uint64_t diagonal = level + depth;
-
-    return ((diagonal * (diagonal + 1U)) / 2U) + depth;
-}
-
 static KeyTable createtable(void)
 {
     KeyTable table = {0};
-    table.keys = calloc(INFINITE_KEY_CAPACITY, sizeof(*table.keys));
+    table.keys = cuckooallocate();
     if (table.keys == NULL) fatal("failed to allocate infinite-key hash table");
-
-    size_t capacity = INFINITE_KEY_INITIAL_CAPACITY;
-    size_t offset = 0;
-
-    for (size_t level = 0; level < INFINITE_KEY_LEVEL_COUNT; ++level) {
-        table.capacities[level] = capacity;
-        table.offsets[level] = offset;
-        offset += capacity;
-        capacity /= 2U;
-    }
     return table;
 }
 
@@ -337,23 +298,15 @@ static void inserttablekey(KeyTable *table, uint64_t key)
 {
     if (key == 0) fatal("cannot insert an empty infinite key");
 
-    for (uint64_t depth = 0; depth < INFINITE_KEY_PROBE_DEPTH; ++depth) {
-        for (size_t level = 0; level < INFINITE_KEY_LEVEL_COUNT; ++level) {
-            uint64_t sequence = packedkeyprobemap((uint64_t)level, depth);
-            size_t localindex =
-                (size_t)packedkeyprobemix(key, sequence) &
-                (table->capacities[level] - 1U);
-            size_t index = table->offsets[level] + localindex;
-
-            if (table->keys[index] == key) return;
-            if (table->keys[index] == 0) {
-                table->keys[index] = key;
-                table->count++;
-                return;
-            }
-        }
+    if (table->count >= INFINITE_KEY_CAPACITY) {
+        if (cuckoocontains(table->keys, key)) return;
+        fatal("infinite-key table is full");
     }
-    fatal("infinite-key table exceeded its probe space");
+    int result = cuckooinsert(table->keys, key);
+    if (result < 0) {
+        fatal("blocked cuckoo table cannot place key: relocation limit reached");
+    }
+    table->count += (size_t)result;
 }
 
 static int parseline(char *line, const char *inputpath, size_t linenumber,
@@ -487,23 +440,30 @@ static void writeheader(const char *outputpath, const char *temppath,
         "#define INFINITE_KEY_S_TOKEN %uU\n"
         "#define INFINITE_KEY_K_TOKEN %uU\n"
         "#define INFINITE_KEY_X_TOKEN %uU\n"
-        "#define INFINITE_KEY_INITIAL_CAPACITY %uU\n"
-        "#define INFINITE_KEY_LEVEL_COUNT %uU\n"
-        "#define INFINITE_KEY_PROBE_DEPTH %uU\n"
+        "#define INFINITE_KEY_CUCKOO_VERSION %uU\n"
+        "#define INFINITE_KEY_BUCKET_SIZE %uU\n"
+        "#define INFINITE_KEY_BUCKET_COUNT %uU\n"
         "#define INFINITE_KEY_CAPACITY %uU\n"
         "#define INFINITE_KEY_COUNT %zuU\n\n"
-        "static const uint64_t infinite_keys[INFINITE_KEY_CAPACITY] = {\n",
+        "/* Extra bucket stores zero-key presence, outside the hashed slots. */\n"
+        "_Alignas(%zu) static const uint64_t infinite_keys[INFINITE_KEY_CAPACITY + INFINITE_KEY_BUCKET_SIZE] = {\n",
         PACKED_KEY_TOKEN_BITS, PACKED_TOKEN_APPLICATION,
         PACKED_TOKEN_S, PACKED_TOKEN_K, PACKED_TOKEN_X,
-        INFINITE_KEY_INITIAL_CAPACITY, INFINITE_KEY_LEVEL_COUNT,
-        INFINITE_KEY_PROBE_DEPTH, INFINITE_KEY_CAPACITY,
-        table->count) < 0;
+        CUCKOO_HASH_VERSION, CUCKOO_BUCKET_SIZE, CUCKOO_BUCKET_COUNT,
+        INFINITE_KEY_CAPACITY, table->count,
+        CUCKOO_BUCKET_SIZE * sizeof(uint64_t)) < 0;
 
+    // C11 needs an initializer even when the table has no keys.
+    if (!failed && table->count == 0U) failed = fprintf(output, "    0,\n") < 0;
     for (size_t i = 0; (i < INFINITE_KEY_CAPACITY) && !failed; ++i) {
         if (table->keys[i] == 0) continue;
         failed = fprintf(output,
                          "    [%zu] = UINT64_C(0x%" PRIx64 "),\n",
                          i, table->keys[i]) < 0;
+    }
+    if (!failed && cuckoocontains(table->keys, 0)) {
+        failed = fprintf(output, "    [%u] = UINT64_C(0x1),\n",
+                         INFINITE_KEY_CAPACITY) < 0;
     }
     if (!failed) {
         failed = fprintf(output,
@@ -561,7 +521,7 @@ int main(int argc, char **argv)
     writeheader(outputpath, temppath, &table);
     printf("wrote %zu packed keys in %u slots to %s\n",
            table.count, INFINITE_KEY_CAPACITY, outputpath);
-    free(table.keys);
+    cuckoofree(table.keys);
     free(temppath);
     free(outputpath);
     free(inputpath);

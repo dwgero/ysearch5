@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <sched.h>
 #include <inttypes.h>
+#include "cuckoo.h"
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -117,7 +118,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.10.0";
+static char version[] = "1.11.0";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -151,7 +152,7 @@ static inline unsigned ctz64(uint64_t x)
     uint64_t lowest_set_bit = x & -x;
 
     // 2. Define the 64-entry De Bruijn lookup table
-    static const unsigned MultiplyDeBruijnBitPosition64[64] = {
+    static const unsigned ctzTable64[64] = {
         0,  1,  2, 53,  3,  7, 54, 27,  4, 38, 41,  8, 34, 55, 48, 28,
        62,  5, 39, 46, 44, 42, 22,  9, 24, 35, 59, 56, 49, 18, 29, 11,
        63, 52,  6, 26, 37, 40, 33, 47, 61, 45, 43, 21, 23, 58, 17, 10,
@@ -159,11 +160,59 @@ static inline unsigned ctz64(uint64_t x)
     };
 
     // 3. Multiply by 64-bit De Bruijn constant and shift right by 58 to get a unique 6-bit index
-    return MultiplyDeBruijnBitPosition64[(uint64_t)(lowest_set_bit * 0x022FDD63CC95386DULL) >> 58];
+    return ctzTable64[(lowest_set_bit * 0x022FDD63CC95386DULL) >> 58];
 
 #endif
 }
 #endif
+
+static inline unsigned clz64(uint64_t x) {
+    if (x == 0) {
+        return 64;
+    }
+    
+#if (defined(__IBMC__) || defined(__IBMCPP__)) && !defined(__clang__)
+    return (unsigned)__cntlz8((unsigned long long)x);
+
+#elif defined(__clang__) || defined(__GNUC__)
+    return (unsigned)__builtin_clzll((unsigned long long)x);
+
+#elif defined(_MSC_VER)
+    unsigned long index;
+
+    #if defined(_M_X64) || defined(_M_ARM64)
+        (void)_BitScanReverse64(&index, (unsigned __int64)x);
+        return (unsigned)(63 - index);
+    #else
+        if (_BitScanReverse(&index, (unsigned long)(x >> 32))) {
+            return (unsigned)(31 - index);
+        }
+        (void)_BitScanReverse(&index, (unsigned long)x);
+        return (unsigned)(63 - index);
+    #endif
+
+#else
+    // Mathematically verified lookup table for the CLZ magic number 0x03F6EAF2CD271461ULL
+    static const unsigned clzTable64[64] = {
+        63,  5, 62,  4, 16, 10, 61,  3, 24, 15, 36,  9, 30, 21, 60,  2,
+        12, 26, 23, 14, 45, 35, 43,  8, 33, 29, 52, 20, 49, 41, 59,  1,
+         6, 17, 11, 25, 37, 31, 22, 13, 27, 46, 44, 34, 53, 50, 42,  7,
+        18, 38, 32, 28, 47, 54, 51, 19, 39, 48, 55, 40, 56, 57, 58,  0
+    };
+
+    // 1. Smear the leading 1-bit all the way down to the right across 64 bits
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    x |= x >> 32;
+
+    // 2. Multiply by a 64-bit De Bruijn constant (B(2, 6))
+    // 3. Shift right by 58 to isolate the top 6 bits as the table index
+    return clzTable64[(x * 0x03F6EAF2CD271461ULL) >> 58];
+#endif
+}
 
 #if DOSEARCH
 static inline unsigned popcount32(uint32_t x)
@@ -281,16 +330,7 @@ _Static_assert((uint_fast32_t)MAXARRAY < MEMO_NORMAL_BIT,
                "arena indices and memo references must fit below memo flags");
 typedef uint64_t PackedKey;
 
-#define PACKED_KEY_INITIAL_CAPACITY (512U * 1024U)
-#define PACKED_KEY_MAX_LEVELS 16U
-#define PACKED_KEY_PROBE_DEPTH 32U
-#define PACKED_KEY_TOTAL_CAPACITY ((2U * PACKED_KEY_INITIAL_CAPACITY) - 16U)
-_Static_assert((PACKED_KEY_INITIAL_CAPACITY &
-                (PACKED_KEY_INITIAL_CAPACITY - 1U)) == 0U,
-               "initial packed-key capacity must be a power of two");
-_Static_assert((PACKED_KEY_INITIAL_CAPACITY >>
-                (PACKED_KEY_MAX_LEVELS - 1U)) == 16U,
-               "packed-key level geometry must end at 16 slots");
+#define PACKED_KEY_TOTAL_CAPACITY CUCKOO_SLOT_COUNT
 
 typedef struct {
 #if HAS_INFINITE_H
@@ -298,9 +338,6 @@ typedef struct {
 #else
     PackedKey *keys;
 #endif
-    size_t leveloffsets[PACKED_KEY_MAX_LEVELS];
-    size_t capacities[PACKED_KEY_MAX_LEVELS];
-    size_t levelcount;
     size_t capacity;
     size_t size;
 } PackedKeySet;
@@ -1479,17 +1516,7 @@ _Static_assert(((4U * MAXLEN) + 2U) <= PACKED_KEY_BITS,
 
 static inline unsigned packedkeybits(PackedKey key) {
     if (key <= PACKED_KEY_K) return PACKED_KEY_TOKEN_BITS;
-#if defined(__clang__) || defined(__GNUC__)
-    return PACKED_KEY_BITS - (unsigned)__builtin_clzll(key);
-#else
-    unsigned bits = 0;
-
-    do {
-        bits++;
-        key >>= 1;
-    } while (key != 0);
-    return bits;
-#endif
+    return PACKED_KEY_BITS - clz64(key);
 }
 
 #if PARANOID
@@ -1543,44 +1570,10 @@ static inline PackedKey packedapplicationkey(PackedKey left,
            (left << rightbits) | right;
 }
 
-static inline uint64_t packedkeyprobemix(PackedKey key, uint64_t step) {
-    uint64_t mixed = key ^
-        (step * UINT64_C(0x9e3779b97f4a7c15));
-
-    mixed ^= mixed >> 30;
-    mixed *= UINT64_C(0xbf58476d1ce4e5b9);
-    mixed ^= mixed >> 27;
-    return mixed;
-}
-
-static inline uint64_t packedkeyprobemap(uint64_t level, uint64_t depth) {
-    uint64_t diagonal = level + depth;
-
-    return ((diagonal * (diagonal + 1U)) / 2U) + depth;
-}
-
-static void configurepackedkeyset(PackedKeySet *set) {
-    size_t capacity = PACKED_KEY_INITIAL_CAPACITY;
-    size_t offset = 0;
-
-    set->levelcount = 0;
-    while ((capacity > 4U) &&
-           (set->levelcount < PACKED_KEY_MAX_LEVELS)) {
-        size_t level = set->levelcount;
-
-        set->capacities[level] = capacity;
-        set->leveloffsets[level] = offset;
-        offset += capacity;
-        capacity /= 2U;
-        set->levelcount++;
-    }
-    set->capacity = offset;
-}
-
 #if !HAS_INFINITE_H
 static void initializepackedkeyset(PackedKeySet *set) {
-    configurepackedkeyset(set);
-    set->keys = calloc(set->capacity, sizeof(*set->keys));
+    set->capacity = PACKED_KEY_TOTAL_CAPACITY;
+    set->keys = cuckooallocate();
     if (set->keys == NULL) {
         fprintf(stderr, "failed to allocate packed-key set for %s\n",
                 infinitepath);
@@ -1595,54 +1588,33 @@ static int packedkeysetinsert(PackedKeySet *set, PackedKey key) {
                 infinitepath);
         exit(EXIT_FAILURE);
     }
-    for (uint64_t depth = 0; depth < PACKED_KEY_PROBE_DEPTH; ++depth) {
-        for (size_t level = 0; level < set->levelcount; ++level) {
-            uint64_t sequence = packedkeyprobemap((uint64_t)level, depth);
-            size_t localindex =
-                (size_t)packedkeyprobemix(key, sequence) &
-                (set->capacities[level] - 1U);
-            size_t index = set->leveloffsets[level] + localindex;
-
-            if (set->keys[index] == key) return 0;
-            if (set->keys[index] == 0) {
-                set->keys[index] = key;
-                set->size++;
-                return 1;
-            }
-        }
+    if (set->size >= set->capacity) {
+        if (cuckoocontains(set->keys, key)) return 0;
+        fprintf(stderr, "packed-key set for %s is full (%zu slots)\n",
+                infinitepath, set->capacity);
+        exit(EXIT_FAILURE);
     }
-    fprintf(stderr,
-            "packed-key set for %s exceeded its %u-by-%zu probe space\n",
-            infinitepath, PACKED_KEY_PROBE_DEPTH, set->levelcount);
-    exit(EXIT_FAILURE);
+    int result = cuckooinsert(set->keys, key);
+    if (result < 0) {
+        fprintf(stderr,
+                "blocked cuckoo set for %s cannot place key 0x%" PRIx64
+                " (%zu keys, %zu slots); relocation limit reached\n",
+                infinitepath, (uint64_t)key, set->size, set->capacity);
+        exit(EXIT_FAILURE);
+    }
+    set->size += (size_t)result;
+    return result;
 }
 #endif
 
 static int packedkeysetcontains(const PackedKeySet *set, PackedKey key) {
-    if ((set->keys == NULL) || (key == 0)) return 0;
-    for (uint64_t depth = 0; depth < PACKED_KEY_PROBE_DEPTH; ++depth) {
-        for (size_t level = 0; level < set->levelcount; ++level) {
-            uint64_t sequence = packedkeyprobemap((uint64_t)level, depth);
-            size_t localindex =
-                (size_t)packedkeyprobemix(key, sequence) &
-                (set->capacities[level] - 1U);
-            size_t index = set->leveloffsets[level] + localindex;
-            PackedKey found = set->keys[index];
-
-            if (found == key) return 1;
-            // There are no deletions and insertion uses the first empty
-            // candidate, so an empty slot proves that key was never inserted.
-            if (found == 0) return 0;
-        }
-    }
-    return 0;
+    return cuckoocontains(set->keys, key);
 }
 
 #if !HAS_INFINITE_H
 static void destroypackedkeyset(PackedKeySet *set) {
-    free(set->keys);
+    cuckoofree(set->keys);
     set->keys = NULL;
-    set->levelcount = 0;
     set->capacity = 0;
     set->size = 0;
 }
@@ -1960,7 +1932,8 @@ static int writeinfiniteheader(void) {
     char *outputpath = NULL;
     char *temppath = NULL;
     FILE *output = NULL;
-    size_t count = 0;
+    unsigned haszero = cuckoocontains(neverendingset.keys, 0) != 0;
+    size_t count = haszero;
 
     // The startup table already contains the merged discoveries. Preserve
     // its slots directly, without sorting or allocating another key buffer.
@@ -2011,23 +1984,31 @@ static int writeinfiniteheader(void) {
         "#define INFINITE_KEY_S_TOKEN %" PRIu64 "U\n"
         "#define INFINITE_KEY_K_TOKEN %" PRIu64 "U\n"
         "#define INFINITE_KEY_X_TOKEN %" PRIu64 "U\n"
-        "#define INFINITE_KEY_INITIAL_CAPACITY %uU\n"
-        "#define INFINITE_KEY_LEVEL_COUNT %uU\n"
-        "#define INFINITE_KEY_PROBE_DEPTH %uU\n"
+        "#define INFINITE_KEY_CUCKOO_VERSION %uU\n"
+        "#define INFINITE_KEY_BUCKET_SIZE %uU\n"
+        "#define INFINITE_KEY_BUCKET_COUNT %uU\n"
         "#define INFINITE_KEY_CAPACITY %uU\n"
         "#define INFINITE_KEY_COUNT %zuU\n\n"
-        "static const uint64_t infinite_keys[INFINITE_KEY_CAPACITY] = {\n",
+        "/* Extra bucket stores zero-key presence, outside the hashed slots. */\n"
+        "_Alignas(%zu) static const uint64_t infinite_keys[INFINITE_KEY_CAPACITY + INFINITE_KEY_BUCKET_SIZE] = {\n",
         PACKED_KEY_TOKEN_BITS, (uint64_t)PACKED_TOKEN_APPLICATION,
         (uint64_t)PACKED_TOKEN_S, (uint64_t)PACKED_TOKEN_K,
-        (uint64_t)PACKED_TOKEN_X, PACKED_KEY_INITIAL_CAPACITY,
-        PACKED_KEY_MAX_LEVELS,
-        PACKED_KEY_PROBE_DEPTH, PACKED_KEY_TOTAL_CAPACITY, count) < 0;
+        (uint64_t)PACKED_TOKEN_X, CUCKOO_HASH_VERSION,
+        CUCKOO_BUCKET_SIZE, CUCKOO_BUCKET_COUNT,
+        PACKED_KEY_TOTAL_CAPACITY, count,
+        CUCKOO_BUCKET_SIZE * sizeof(PackedKey)) < 0;
 
+    // C11 needs an initializer even when there are no designated key entries.
+    if (!failed && count == 0U) failed = fprintf(output, "    0,\n") < 0;
     for (size_t i = 0; (i < neverendingset.capacity) && !failed; ++i) {
         if (neverendingset.keys[i] == 0) continue;
         failed = fprintf(output,
                          "    [%zu] = UINT64_C(0x%" PRIx64 "),\n",
                          i, (uint64_t)neverendingset.keys[i]) < 0;
+    }
+    if (!failed && haszero) {
+        failed = fprintf(output, "    [%u] = UINT64_C(0x1),\n",
+                         PACKED_KEY_TOTAL_CAPACITY) < 0;
     }
     if (!failed) {
         failed = fprintf(output,
@@ -2069,7 +2050,7 @@ static int writeinfiniteheader(void) {
         goto cleanup;
     }
 #endif
-    printf("wrote %zu packed keys in %u elastic slots to %s\n",
+    printf("wrote %zu packed keys in %u blocked cuckoo slots to %s\n",
            count, PACKED_KEY_TOTAL_CAPACITY, outputpath);
     result = EXIT_SUCCESS;
 
@@ -2090,22 +2071,28 @@ _Static_assert(INFINITE_KEY_K_TOKEN == PACKED_TOKEN_K,
                "embedded infinite-key K token mismatch");
 _Static_assert(INFINITE_KEY_X_TOKEN == PACKED_TOKEN_X,
                "embedded infinite-key x token mismatch");
-_Static_assert(INFINITE_KEY_INITIAL_CAPACITY ==
-               PACKED_KEY_INITIAL_CAPACITY,
-               "embedded infinite-key initial capacity mismatch");
-_Static_assert(INFINITE_KEY_LEVEL_COUNT == PACKED_KEY_MAX_LEVELS,
-               "embedded infinite-key level count mismatch");
-_Static_assert(INFINITE_KEY_PROBE_DEPTH == PACKED_KEY_PROBE_DEPTH,
-               "embedded infinite-key probe depth mismatch");
+#ifndef INFINITE_KEY_CUCKOO_VERSION
+#error "infinite.h must be regenerated with blocked cuckoo hashing"
+#else
+_Static_assert(INFINITE_KEY_CUCKOO_VERSION == CUCKOO_HASH_VERSION,
+               "embedded infinite-key cuckoo hash version mismatch");
+_Static_assert(INFINITE_KEY_BUCKET_SIZE == CUCKOO_BUCKET_SIZE,
+               "embedded infinite-key bucket size mismatch");
+_Static_assert(INFINITE_KEY_BUCKET_COUNT == CUCKOO_BUCKET_COUNT,
+               "embedded infinite-key bucket count mismatch");
+#endif
 _Static_assert(INFINITE_KEY_CAPACITY == PACKED_KEY_TOTAL_CAPACITY,
                "embedded infinite-key total capacity mismatch");
-_Static_assert(INFINITE_KEY_COUNT <= INFINITE_KEY_CAPACITY,
+_Static_assert(sizeof(infinite_keys) / sizeof(infinite_keys[0]) ==
+               PACKED_KEY_TOTAL_CAPACITY + CUCKOO_BUCKET_SIZE,
+               "embedded infinite-key storage must include the zero-key bucket");
+_Static_assert(INFINITE_KEY_COUNT <= INFINITE_KEY_CAPACITY + 1U,
                "embedded infinite-key count exceeds capacity");
 
 static void readinfiniteh(void) {
     infinitepath = "infinite.h";
     neverendingset.keys = infinite_keys;
-    configurepackedkeyset(&neverendingset);
+    neverendingset.capacity = PACKED_KEY_TOTAL_CAPACITY;
     neverendingset.size = INFINITE_KEY_COUNT;
 }
 #endif

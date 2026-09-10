@@ -74,9 +74,35 @@ Run it with:
 ```
 The packed-key hash table is compiled into the executable. This mode does not
 read or write `infinite.cmb` at runtime. Its single contiguous array is
-divided into 16 geometrically shrinking levels, from 524,288 slots down to
-16, for 1,048,560 slots total. Insertion and lookup use the same triangularly
-mapped, mixed probe sequence across the levels.
+divided into 163,840 aligned four-key buckets, for 655,360 hashed slots,
+plus one extra bucket for zero-key presence (5,242,912 bytes: 5 MiB + 32 bytes).
+Blocked cuckoo hashing gives each complete
+key two candidate buckets; lookup checks at most eight full 64-bit keys, not
+fingerprints. There are no probabilistic matches. The shared `cuckoo.h`
+keeps the runtime and header generator's hash functions identical.
+
+The table uses two seeded MurmurHash3 finalizer
+hashes and fills the first bucket before the second. When both buckets are
+full, insertion evicts a key and tries its alternate bucket, for at most
+160 kicks. A 640-byte temporary stack journal reverses every swap if the limit
+is reached, leaving the table unchanged and reporting an error. The sample's
+50-kick limit is insufficient for the full 600,907-key catalogue, which
+occupies about 91.69% of the hashed slots.
+
+Insertion assumes tables are built through this API without deletions:
+occupied slots form a prefix in each bucket, and a key in its second bucket
+has a full first bucket. This permits returning at the first empty slot
+without missing duplicates. Arbitrarily populated tables with holes do not
+satisfy this insertion contract.
+
+This is hash-layout version 2. Headers from the previous cuckoo hashes or
+the old elastic layout or previous capacity must be regenerated; incompatible
+header metadata or missing extra-bucket storage is rejected at compilation.
+Key encoding is unchanged. Both header generators reserve the extra bucket,
+whose first slot is a zero-presence flag, not another hashed key. An absent
+zero key leaves the bucket implicitly zero-filled. The generic table supports
+zero, but catalogues still contain only closed S/K expressions; `makeinfcmb`
+rejects headers with zero membership instead of interpreting the flag as `S`.
 
 Packed keys contain only the raw two-bit preorder expression: `x = 00`,
 `S = 01`, `K = 10`, and application `= 11`. There is no length field. Every
@@ -173,7 +199,8 @@ xcrun clang \
 ./build/makeinfh
 ```
 `makeinfh` reads `build/infinite.cmb`, validates each record, and inserts it
-directly into one approximately 8 MiB hash table, ignoring duplicate keys.
+directly into one 5 MiB + 32-byte blocked cuckoo table, ignoring
+duplicate keys.
 It then atomically writes that table to `build/infinite.h`. Input order can
 affect hash-slot placement, but not the stored key set or lookup behavior.
 If the search finds no divergences, it creates a comment-only catalogue;
@@ -181,14 +208,15 @@ the converter currently rejects such an empty catalogue.
 
 ### 5. Compile the embedded-catalogue search
 
-The generated header is in `build`, so add that directory to the include
-path:
+Compile a copy of the source beside the generated header so an older header
+in the repository root cannot take precedence:
 ```sh
+cp main.c cuckoo.h build/
 xcrun clang \
   -std=c11 -O3 -march=native -DNDEBUG \
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror \
-  -pthread -DHAS_INFINITE_H=1 -Ibuild \
-  main.c -o build/ysearch5
+  -pthread -DHAS_INFINITE_H=1 \
+  build/main.c -o build/ysearch5
 ```
 Run the embedded version with:
 ```sh
@@ -197,7 +225,7 @@ Run the embedded version with:
 ## File-backed reuse with an existing `infinite.cmb`
 
 If a valid `infinite.cmb` already exists beside a file-backed `ysearch5-noh`
-executable, the program allocates one approximately 8 MiB hash table and
+executable, the program allocates one 5 MiB + 32-byte hash table and
 inserts each validated catalogue entry directly into it. Duplicate keys count
 once. With `N` unique loaded keys, it allocates an append-only array of
 `655360 - N` 64-bit entries. During search the table is a read-only exact-match
@@ -211,15 +239,34 @@ discovery order can affect slot placement, but not the stored key set or
 lookup behavior.
 
 The original `infinite.cmb` remains untouched. With the current 600,907-key
-catalogue, key buffers peak at about 8.415 MiB during search and merging,
-then fall to approximately 8 MiB for header output. These sizes exclude
-evaluator memory and runtime overhead.
+catalogue, key buffers peak at about 5.415 MiB during search and merging,
+then fall to 5 MiB + 32 bytes for header output. These sizes exclude
+relocation scratch, evaluator memory, and runtime overhead.
+
+The append-array budget remains 655,360 entries, equal to the number of hashed
+slots. That collection budget does not guarantee all keys will
+fit in the table: a full table or exhausted relocation search fails explicitly
+before replacing `infinite.h`. No table resizing or second key table is used.
 
 ## Parallelism and limits
 
 At startup, the multithreaded build uses the number of online logical CPUs
 minus one worker, clamped to the range 1 through 64. Search length, arena
 limits, and step limits are compile-time constants near the top of `main.c`.
+
+## Hash-table regression tests
+
+Run `tests/test-cuckoo.sh` with the complete current 600,907-key `infinite.cmb`
+in the repository root, or pass its path as the first argument. The tests
+use Clang (or `CC`) with AddressSanitizer and UndefinedBehaviorSanitizer to
+check allocation, seven insertion orders, exact lookup, duplicate handling,
+relocation, and unchanged table contents after insertion failure. Test
+executables use temporary directories and do not modify catalogue files.
+
+Run `sh tests/test-headers.sh` to check both header writers with empty,
+ordinary-key, zero-only, and mixed tables. It also verifies decoder behavior
+and rejection of embedded headers missing the extra bucket. No catalogue
+is required; generated headers are compiled and checked under both sanitizers.
 
 ## License
 

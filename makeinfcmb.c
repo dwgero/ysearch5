@@ -34,7 +34,7 @@
 #include <unistd.h>
 #endif
 
-static const char version[] = "1.11.1";
+static const char version[] = "1.11.2";
 
 #define PACKED_KEY_BITS 64U
 #define PACKED_KEY_TOKEN_BITS 2U

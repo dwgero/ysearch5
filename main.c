@@ -105,6 +105,10 @@
 
 #if defined(__clang__)
     #define DEBUG_TRAP() __builtin_debugtrap()
+#elif defined(__i386__) || defined(__x86_64__)
+    #define DEBUG_TRAP() __asm__ volatile("int $3")
+#elif defined(__aarch64__)
+    #define DEBUG_TRAP() __asm__ volatile(".inst 0xd4200000");
 #elif defined(__GNUC__)
     #include <signal.h>
     #define DEBUG_TRAP() raise(SIGTRAP)
@@ -118,7 +122,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.11.1";
+static char version[] = "1.11.2";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)

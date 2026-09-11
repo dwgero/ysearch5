@@ -103,15 +103,55 @@
 #include "infinite.h"
 #endif
 
-#if defined(__clang__)
+#ifndef __has_builtin
+    #define __has_builtin(x) 0
+#endif
+
+#if defined(__cplusplus) && (__cplusplus >= 202600L)
+    #include <debugging>
+    #define DEBUG_TRAP() std::breakpoint()
+#elif defined(_MSC_VER)
+    #define DEBUG_TRAP() __debugbreak()
+#elif defined(__clang__) && __has_builtin(__builtin_debugtrap)
     #define DEBUG_TRAP() __builtin_debugtrap()
-#elif defined(__i386__) || defined(__x86_64__)
-    #define DEBUG_TRAP() __asm__ volatile("int $3")
-#elif defined(__aarch64__)
+#elif defined(__i386__) || defined(_M_IX86) || defined(__x86_64__) || defined(_M_X64)
+    #define DEBUG_TRAP() __asm__ volatile(".byte 0xCC")
+#elif defined(__aarch64__) || defined(_M_ARM64)
     #define DEBUG_TRAP() __asm__ volatile(".inst 0xd4200000");
-#elif defined(__GNUC__)
+#elif defined(__thumb2__)
+    #if defined(__linux__)
+        #define DEBUG_TRAP() __asm__ volatile(".inst.n 0xde01")
+    #else
+        #define DEBUG_TRAP() __asm__ volatile(".inst.n 0xbe00")
+    #endif
+#elif defined(__thumb__)
+    #if defined(__linux__)
+        #define DEBUG_TRAP() __asm__ volatile(".inst 0xde01")
+    #else
+        #define DEBUG_TRAP() __asm__ volatile(".inst 0xbe00")
+    #endif
+#elif defined(__arm__)
+    #if defined(__linux__)
+        #define DEBUG_TRAP() __asm__ volatile(".inst 0xe7f001f0")
+    #else
+        #define DEBUG_TRAP() __asm__ volatile(".inst 0xe1200070")
+    #endif
+#elif defined(__linux__) || defined(__apple__) || defined(__unix__)
     #include <signal.h>
-    #define DEBUG_TRAP() raise(SIGTRAP)
+    #include <unistd.h>
+    #if defined(SYS_gettid) && defined(SIGTRAP)
+        #include <sys/syscall.h>
+        #define DEBUG_TRAP() syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGTRAP)
+    #else
+        #define DEBUG_TRAP() raise(SIGTRAP)
+    #endif
+#elif defined(_WIN32) || defined(_WIN64)
+    #ifdef __cplusplus
+        extern "C" __declspec(dllimport) void __stdcall DebugBreak(void);
+    #else
+        __declspec(dllimport) void __stdcall DebugBreak(void);
+    #endif
+    #define DEBUG_TRAP() DebugBreak()
 #else
     #define DEBUG_TRAP() abort()
 #endif
@@ -122,7 +162,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.11.2";
+static char version[] = "1.12.0";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)

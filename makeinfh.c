@@ -35,7 +35,7 @@
 #include <unistd.h>
 #endif
 
-static const char version[] = "1.12.0";
+static const char version[] = "1.13.0";
 
 #define PACKED_KEY_TOKEN_BITS 2U
 #define PACKED_KEY_BITS 64U
@@ -432,8 +432,8 @@ static void writeheader(const char *outputpath, const char *temppath,
         "* You should have received a copy of the GNU General Public License\n"
         "* along with this program.  If not, see <http://www.gnu.org/licenses/>.\n"
         "*/\n"
-        "#ifndef __INFINITE_H_\n"
-        "#define __INFINITE_H_\n\n"
+        "#ifndef INFINITE_H\n"
+        "#define INFINITE_H\n\n"
         "#include <stdint.h>\n\n"
         "#define INFINITE_KEY_TOKEN_BITS %uU\n"
         "#define INFINITE_KEY_APPLICATION_TOKEN %uU\n"
@@ -464,7 +464,7 @@ static void writeheader(const char *outputpath, const char *temppath,
     if (!failed) {
         failed = fprintf(output,
             "};\n\n"
-            "#endif /* __INFINITE_H_ */\n") < 0;
+            "#endif /* INFINITE_H */\n") < 0;
     }
     int writeerror = errno ? errno : EIO;
 

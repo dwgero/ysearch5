@@ -69,13 +69,23 @@ for writer in ysearch makeinfh; do
     done
 done
 
-# Compile the real embedded path against a modern header first, then strip only
-# its extra bucket. Unchanged geometry/count must not hide the stale extent.
+# Compile the real embedded path against a modern header first, then test stale
+# hash metadata and storage extent independently with unchanged geometry/count.
 mkdir "$test_dir/embedded"
 cp "$test_root/main.c" "$test_root/cuckoo.h" "$test_dir/embedded/"
 cp "$test_dir/ysearch-1/infinite.h" "$test_dir/embedded/infinite.h"
 "${CC:-clang}" "$@" -pthread -DSINGLE_THREAD=1 -DHAS_INFINITE_H=1 \
     -fsyntax-only "$test_dir/embedded/main.c"
+sed 's/^#define INFINITE_KEY_CUCKOO_VERSION .*/#define INFINITE_KEY_CUCKOO_VERSION 2U/' \
+    "$test_dir/ysearch-1/infinite.h" > "$test_dir/embedded/infinite.h"
+if "${CC:-clang}" "$@" -pthread -DSINGLE_THREAD=1 -DHAS_INFINITE_H=1 \
+    -fsyntax-only "$test_dir/embedded/main.c" > "$test_dir/embedded/rejected.log" 2>&1; then
+    printf 'Embedded compilation unexpectedly accepted the old version-2 hash layout\n' >&2
+    exit 1
+fi
+grep -F 'embedded infinite-key cuckoo hash version mismatch' \
+    "$test_dir/embedded/rejected.log" > /dev/null
+# Start from the current header again so this rejection is only about its tail.
 sed 's/INFINITE_KEY_CAPACITY + INFINITE_KEY_BUCKET_SIZE/INFINITE_KEY_CAPACITY/' \
     "$test_dir/ysearch-1/infinite.h" > "$test_dir/embedded/infinite.h"
 if "${CC:-clang}" "$@" -pthread -DSINGLE_THREAD=1 -DHAS_INFINITE_H=1 \
@@ -85,4 +95,4 @@ if "${CC:-clang}" "$@" -pthread -DSINGLE_THREAD=1 -DHAS_INFINITE_H=1 \
 fi
 grep -F 'embedded infinite-key storage must include the zero-key bucket' \
     "$test_dir/embedded/rejected.log" > /dev/null
-printf 'Both header writers, zero metadata, catalogue decoding, and stale extent checks passed.\n'
+printf 'Both header writers, zero metadata, catalogue decoding, stale hash version, and stale extent checks passed.\n'

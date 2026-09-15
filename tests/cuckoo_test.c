@@ -88,7 +88,7 @@ static uint64_t randomstate = UINT64_C(0xe619a347c728d905);
 static uint64_t randomkey(void)
 {
     randomstate += UINT64_C(0x9e3779b97f4a7c15);
-    return cuckoomix(randomstate);
+    return cuckoohash1(randomstate);
 }
 
 static int comparekeys(const void *left, const void *right)
@@ -120,13 +120,72 @@ static size_t checktable(const uint64_t *table)
         ++count;
         size_t buckets[2];
         cuckoobuckets(table[i], buckets);
-        assert(buckets[0] < CUCKOO_BUCKET_COUNT);
-        assert(buckets[1] < CUCKOO_BUCKET_COUNT);
+        assert(buckets[0] < CUCKOO_HALF_BUCKET_COUNT);
+        assert(buckets[1] >= CUCKOO_HALF_BUCKET_COUNT &&
+               buckets[1] < CUCKOO_BUCKET_COUNT);
         assert(i / CUCKOO_BUCKET_SIZE == buckets[0] ||
                i / CUCKOO_BUCKET_SIZE == buckets[1]);
         assert(cuckoocontains(table, table[i]));
     }
     return count;
+}
+
+static void checkhashes(uint64_t *table, size_t bytes)
+{
+    /* Independently calculated with unsigned 64-bit wraparound. Include values
+     * above 32 bits so narrowing before the final modulus cannot pass unnoticed.
+     */
+    static const struct {
+        uint64_t key;
+        uint32_t first, second;
+    } vectors[] = {
+        { UINT64_C(0), 0U, 81920U },
+        { UINT64_C(1), 19244U, 83429U },
+        { UINT64_C(2), 33767U, 136330U },
+        { UINT64_C(0xffffffff), 31942U, 149884U },
+        { UINT64_C(0x100000000), 21529U, 129343U },
+        { UINT64_C(0x0123456789abcdef), 60650U, 135468U },
+        { UINT64_C(0x8000000000000000), 25747U, 158090U },
+        { UINT64_MAX, 7969U, 130427U }
+    };
+    assert(CUCKOO_HASH_VERSION == 3U);
+    assert(CUCKOO_HALF_BUCKET_COUNT == 81920U);
+    assert(CUCKOO_BUCKET_COUNT == 2U * CUCKOO_HALF_BUCKET_COUNT);
+    memset(table, 0, bytes);
+    for (size_t i = 0; i < sizeof vectors / sizeof vectors[0]; ++i) {
+        uint64_t key = vectors[i].key;
+        size_t buckets[2];
+        assert(cuckoohash1(key) == vectors[i].first);
+        assert(cuckoohash2(key) == vectors[i].second);
+        cuckoobuckets(key, buckets);
+        assert(buckets[0] == vectors[i].first);
+        assert(buckets[1] == vectors[i].second);
+        assert(!cuckoocontains(table, key));
+        if (key == 0U) continue; /* Zero uses separate membership metadata. */
+        for (size_t choice = 0; choice < 2U; ++choice) {
+            for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset) {
+                size_t slot = buckets[choice] * CUCKOO_BUCKET_SIZE + offset;
+                table[slot] = key;
+                assert(cuckoocontains(table, key));
+                table[slot] = 0U;
+                assert(!cuckoocontains(table, key));
+            }
+        }
+    }
+    for (size_t i = 0; i < 100128U; ++i) {
+        uint64_t key = i < 64U ? UINT64_C(1) << i :
+                       i < 128U ? ~(UINT64_C(1) << (i - 64U)) :
+                       UINT64_C(0x9e3779b97f4a7c15) * (uint64_t)(i - 127U);
+        size_t buckets[2];
+        cuckoobuckets(key, buckets);
+        assert(buckets[0] == cuckoohash1(key));
+        assert(buckets[1] == cuckoohash2(key));
+        assert(buckets[0] < CUCKOO_HALF_BUCKET_COUNT);
+        assert(buckets[1] >= CUCKOO_HALF_BUCKET_COUNT &&
+               buckets[1] < CUCKOO_BUCKET_COUNT);
+        assert(buckets[0] != buckets[1]);
+    }
+    puts("hash vectors, disjoint halves, high-bit keys, and both-bucket lookup passed");
 }
 
 /* Early insertion requires the invariants preserved by the insertion-only API.
@@ -191,13 +250,35 @@ static void checkzero(uint64_t *table, uint64_t *snapshot, size_t bytes)
 /* Find distinct, legal bucket residents without depending on catalogue keys. */
 static uint64_t nextbucketkey(size_t bucket, uint64_t *cursor)
 {
+    assert(bucket < CUCKOO_BUCKET_COUNT);
+    size_t choice = bucket < CUCKOO_HALF_BUCKET_COUNT ? 0U : 1U;
     size_t homes[2];
     do {
         assert(*cursor < UINT64_C(10000000));
         ++*cursor;
         cuckoobuckets(*cursor, homes);
-    } while (homes[0] != bucket || homes[1] == bucket);
+    } while (homes[choice] != bucket);
     return *cursor;
+}
+
+/* A secondary resident is reachable only after its primary is full. Fill each
+ * prerequisite through the real API, counting support keys as fixture members.
+ */
+static size_t insertsecondaryresident(uint64_t *table, size_t bucket,
+                                      uint64_t *cursor)
+{
+    assert(bucket >= CUCKOO_HALF_BUCKET_COUNT && bucket < CUCKOO_BUCKET_COUNT);
+    uint64_t key = nextbucketkey(bucket, cursor);
+    size_t homes[2];
+    cuckoobuckets(key, homes);
+    size_t added = 0U;
+    for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset) {
+        if (table[homes[0] * CUCKOO_BUCKET_SIZE + offset] != 0U) continue;
+        assert(cuckooinsert(table, nextbucketkey(homes[0], cursor)) == 1);
+        ++added;
+    }
+    assert(cuckooinsert(table, key) == 1);
+    return added + 1U;
 }
 
 static void checkfastpaths(uint64_t *table, uint64_t *snapshot, size_t bytes)
@@ -205,7 +286,7 @@ static void checkfastpaths(uint64_t *table, uint64_t *snapshot, size_t bytes)
     size_t buckets[2];
     uint64_t key = 1U;
     cuckoobuckets(key, buckets);
-    while (buckets[0] == buckets[1]) cuckoobuckets(++key, buckets);
+    assert(buckets[0] != buckets[1]);
     uint64_t cursor = key;
     size_t primary = buckets[0] * CUCKOO_BUCKET_SIZE;
     size_t secondary = buckets[1] * CUCKOO_BUCKET_SIZE;
@@ -225,17 +306,17 @@ static void checkfastpaths(uint64_t *table, uint64_t *snapshot, size_t bytes)
 
     /* A full primary must select the first zero after the secondary prefix. */
     memset(table, 0, bytes);
-    for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset) {
+    for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset)
         assert(cuckooinsert(table, nextbucketkey(buckets[0], &cursor)) == 1);
-        if (offset < CUCKOO_BUCKET_SIZE - 1U)
-            assert(cuckooinsert(table, nextbucketkey(buckets[1], &cursor)) == 1);
-    }
-    assert(checkreachabletable(table) == 2U * CUCKOO_BUCKET_SIZE - 1U);
+    size_t count = CUCKOO_BUCKET_SIZE;
+    for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE - 1U; ++offset)
+        count += insertsecondaryresident(table, buckets[1], &cursor);
+    assert(checkreachabletable(table) == count);
     memcpy(snapshot, table, bytes);
     snapshot[secondary + CUCKOO_BUCKET_SIZE - 1U] = key;
     assert(cuckooinsert(table, key) == 1);
     assert(memcmp(table, snapshot, bytes) == 0);
-    assert(checkreachabletable(table) == 2U * CUCKOO_BUCKET_SIZE);
+    assert(checkreachabletable(table) == count + 1U);
     assert(cuckooinsert(table, key) == 0);
     assert(memcmp(table, snapshot, bytes) == 0);
 
@@ -253,33 +334,31 @@ static void checkfastpaths(uint64_t *table, uint64_t *snapshot, size_t bytes)
         }
     }
 
-    /* Independently reduced hashes may legitimately choose the same bucket. */
-    key = 0U;
-    do {
-        assert(key < UINT64_C(10000000));
-        cuckoobuckets(++key, buckets);
-    } while (buckets[0] != buckets[1]);
-    primary = buckets[0] * CUCKOO_BUCKET_SIZE;
+    /* The disjoint candidates cannot coincide. Fill both through reachable
+     * insertions to require a real eviction rather than either fast path.
+     */
     memset(table, 0, bytes);
-    assert(cuckooinsert(table, key) == 1);
-    assert(table[primary] == key && checkreachabletable(table) == 1U);
-    memcpy(snapshot, table, bytes);
-    assert(cuckooinsert(table, key) == 0);
-    assert(memcmp(table, snapshot, bytes) == 0);
-
-    /* The same-bucket incoming key must also survive a real eviction. */
-    memset(table, 0, bytes);
-    cursor = key;
     for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset)
         assert(cuckooinsert(table, nextbucketkey(buckets[0], &cursor)) == 1);
-    assert(checkreachabletable(table) == CUCKOO_BUCKET_SIZE);
+    count = CUCKOO_BUCKET_SIZE;
+    for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset)
+        count += insertsecondaryresident(table, buckets[1], &cursor);
+    assert(checkreachabletable(table) == count);
+    assert(bothfull(table, key));
     memcpy(snapshot, table, bytes);
     assert(cuckooinsert(table, key) == 1);
     assert(cuckoocontains(table, key));
-    assert(checkreachabletable(table) == CUCKOO_BUCKET_SIZE + 1U);
-    for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset)
-        assert(cuckoocontains(table, snapshot[primary + offset]));
-    puts("primary preference, reachable duplicates, hole lookup, same-bucket choices passed");
+    assert(checkreachabletable(table) == count + 1U);
+    size_t changed = 0U;
+    for (size_t slot = 0; slot < CUCKOO_SLOT_COUNT; ++slot) {
+        if (table[slot] != snapshot[slot]) ++changed;
+        if (snapshot[slot] != 0U) assert(cuckoocontains(table, snapshot[slot]));
+    }
+    assert(changed >= 2U);
+    memcpy(snapshot, table, bytes);
+    assert(cuckooinsert(table, key) == 0);
+    assert(memcmp(table, snapshot, bytes) == 0);
+    puts("primary preference, reachable duplicates, hole lookup, split-half eviction passed");
 }
 
 /* Reduce a valid full table to only the buckets touched by a failed kick walk.
@@ -380,6 +459,7 @@ int main(int argc, char **argv)
     assert(cuckoocontains(NULL, 1U) == 0);
     assert(cuckoocontains(table, 0U) == 0);
     assert(cuckooinsert(NULL, 1U) == -1);
+    checkhashes(table, bytes);
     checkzero(table, snapshot, bytes);
     checkfastpaths(table, snapshot, bytes);
     memset(table, 0, bytes);
@@ -442,7 +522,9 @@ int main(int argc, char **argv)
                trial, count, relocations, maxmoves);
         fflush(stdout);
     }
-    /* A valid full table: every distinct key is in its first candidate bucket. */
+    /* Greedily fill either candidate without relocation: every distinct key is
+     * in a legal bucket, with a full primary for every secondary resident.
+     */
     memset(table, 0, bytes);
     size_t filled = 0U;
     uint64_t lastkey = 0U;
@@ -450,15 +532,19 @@ int main(int argc, char **argv)
         assert(lastkey < UINT64_C(10000000)); /* Bound fixture construction too. */
         ++lastkey;
         cuckoobuckets(lastkey, buckets);
-        for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset) {
-            size_t slot = buckets[0] * CUCKOO_BUCKET_SIZE + offset;
-            if (table[slot] != 0U) continue;
-            table[slot] = lastkey;
-            ++filled;
-            break;
+        int placed = 0;
+        for (size_t choice = 0; choice < 2U && !placed; ++choice) {
+            for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset) {
+                size_t slot = buckets[choice] * CUCKOO_BUCKET_SIZE + offset;
+                if (table[slot] != 0U) continue;
+                table[slot] = lastkey;
+                ++filled;
+                placed = 1;
+                break;
+            }
         }
     }
-    assert(checktable(table) == CUCKOO_SLOT_COUNT);
+    assert(checkreachabletable(table) == CUCKOO_SLOT_COUNT);
     /* Zero remains insertable even when every normal hashed slot is occupied. */
     memcpy(snapshot, table, bytes);
     snapshot[CUCKOO_SLOT_COUNT] = 1U;

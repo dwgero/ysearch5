@@ -81,8 +81,11 @@ key two candidate buckets; lookup checks at most eight full 64-bit keys, not
 fingerprints. There are no probabilistic matches. The shared `cuckoo.h`
 keeps the runtime and header generator's hash functions identical.
 
-The table uses two seeded MurmurHash3 finalizer
-hashes and fills the first bucket before the second. When both buckets are
+The table is split into two halves of 81,920 buckets. An unseeded MurmurHash3
+fmix64 selects the first bucket from the first half, and a SplitMix64 finalizer
+selects the second bucket from the second half. The candidates are always
+distinct. Lookup computes the second hash only after a first-bucket miss.
+Insertion fills the first bucket before the second. When both buckets are
 full, insertion evicts a key and tries its alternate bucket, for at most
 160 kicks. A 640-byte temporary stack journal reverses every swap if the limit
 is reached, leaving the table unchanged and reporting an error.
@@ -92,7 +95,7 @@ occupied slots form a prefix in each bucket, and a key in its second bucket
 has a full first bucket. This permits returning at the first empty slot
 without missing duplicates.
 
-This is hash-layout version 2. Headers from the previous cuckoo hashes or
+This is hash-layout version 3. Headers from the previous cuckoo hashes or
 the old elastic layout or previous capacity must be regenerated; incompatible
 header metadata or missing extra-bucket storage is rejected at compilation.
 Key encoding is unchanged. Both header generators reserve the extra bucket,
@@ -256,14 +259,16 @@ limits, and step limits are compile-time constants near the top of `main.c`.
 Run `sh tests/test-cuckoo.sh` with the complete current 600,907-key `infinite.cmb`
 in the repository root, or pass its path as the first argument. The tests
 use Clang (or `CC`) with AddressSanitizer and UndefinedBehaviorSanitizer to
-check allocation, seven insertion orders, exact lookup, duplicate handling,
-relocation, and unchanged table contents after insertion failure. Test
-executables use temporary directories and do not modify catalogue files.
+check allocation, split-half hash mappings, seven insertion orders, exact
+lookup, duplicate handling, relocation, and unchanged table contents after
+insertion failure. Test executables use temporary directories and do not modify
+catalogue files.
 
 Run `sh tests/test-headers.sh` to check both header writers with empty,
 ordinary-key, zero-only, and mixed tables. It also verifies decoder behavior
-and rejection of embedded headers missing the extra bucket. No catalogue
-is required; generated headers are compiled and checked under both sanitizers.
+and rejection of embedded headers with stale hash versions or missing the
+extra bucket. No catalogue is required; generated headers are compiled and
+checked under both sanitizers.
 
 ## License
 

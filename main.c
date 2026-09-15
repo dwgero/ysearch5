@@ -162,7 +162,7 @@
     #define INT3 fflush(stdout);fflush(stderr);
 #endif
 
-static char version[] = "1.12.0";
+static char version[] = "1.13.0";
 
 #if !SINGLE_THREAD
 static inline unsigned ctz64(uint64_t x)
@@ -2019,8 +2019,8 @@ static int writeinfiniteheader(void) {
         "* You should have received a copy of the GNU General Public License\n"
         "* along with this program.  If not, see <http://www.gnu.org/licenses/>.\n"
         "*/\n"
-        "#ifndef __INFINITE_H_\n"
-        "#define __INFINITE_H_\n\n"
+        "#ifndef INFINITE_H\n"
+        "#define INFINITE_H\n\n"
         "#include <stdint.h>\n\n"
         "#define INFINITE_KEY_TOKEN_BITS %uU\n"
         "#define INFINITE_KEY_APPLICATION_TOKEN %" PRIu64 "U\n"
@@ -2052,7 +2052,7 @@ static int writeinfiniteheader(void) {
     if (!failed) {
         failed = fprintf(output,
                          "};\n\n"
-                         "#endif /* __INFINITE_H_ */\n") < 0;
+                         "#endif /* INFINITE_H */\n") < 0;
     }
     int writeerror = errno ? errno : EIO;
 

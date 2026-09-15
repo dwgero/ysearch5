@@ -17,8 +17,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef YSEARCH5_CUCKOO_H
-#define YSEARCH5_CUCKOO_H
+#ifndef CUCKOO_H
+#define CUCKOO_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -31,15 +31,16 @@
 #define CUCKOO_SLOT_COUNT 655360U
 #define CUCKOO_BUCKET_SIZE 4U
 #define CUCKOO_BUCKET_COUNT (CUCKOO_SLOT_COUNT / CUCKOO_BUCKET_SIZE)
-#define CUCKOO_HASH_VERSION 2U
+#define CUCKOO_HALF_BUCKET_COUNT (CUCKOO_BUCKET_COUNT / 2U)
+#define CUCKOO_HASH_VERSION 3U
 #define CUCKOO_MAX_KICKS 160U
-#define CUCKOO_SEED1 UINT64_C(0x9e3779b97f4a7c15)
-#define CUCKOO_SEED2 UINT64_C(0x3113377ecc00d141)
 
 _Static_assert(CUCKOO_SLOT_COUNT % CUCKOO_BUCKET_SIZE == 0U,
                "cuckoo slots must form complete buckets");
 _Static_assert(CUCKOO_BUCKET_COUNT > 1U && CUCKOO_SLOT_COUNT <= UINT32_MAX,
                "cuckoo slots must fit the rollback journal");
+_Static_assert(CUCKOO_BUCKET_COUNT % 2U == 0U,
+               "cuckoo buckets must form two equal halves");
 _Static_assert(CUCKOO_MAX_KICKS > 0U,
                "cuckoo eviction needs a nonzero kick limit");
 
@@ -67,21 +68,34 @@ static inline void cuckoofree(uint64_t *keys)
 }
 
 /* Changing these hashes requires a new version and regenerated infinite.h. */
-static inline uint64_t cuckoomix(uint64_t value)
+
+/* MurmurHash3 fmix64 selects a bucket in the first half. */
+static inline uint32_t cuckoohash1(uint64_t key)
 {
-    value ^= value >> 33;
-    value *= UINT64_C(0xff51afd7ed558ccd);
-    value ^= value >> 33;
-    value *= UINT64_C(0xc4ceb9fe1a85ec53);
-    return value ^ (value >> 33);
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    key ^= key >> 33;
+    key *= UINT64_C(0xc4ceb9fe1a85ec53);
+    key ^= key >> 33;
+    return (uint32_t)(key % CUCKOO_HALF_BUCKET_COUNT);
+}
+
+/* The SplitMix64 finalizer selects a bucket in the second half. */
+static inline uint32_t cuckoohash2(uint64_t key)
+{
+    key ^= key >> 30;
+    key *= UINT64_C(0xbf58476d1ce4e5b9);
+    key ^= key >> 27;
+    key *= UINT64_C(0x94d049bb133111eb);
+    key ^= key >> 31;
+    return CUCKOO_HALF_BUCKET_COUNT +
+           (uint32_t)(key % CUCKOO_HALF_BUCKET_COUNT);
 }
 
 static inline void cuckoobuckets(uint64_t key, size_t buckets[2])
 {
-    buckets[0] = (size_t)(cuckoomix(key ^ CUCKOO_SEED1) %
-                          CUCKOO_BUCKET_COUNT);
-    buckets[1] = (size_t)(cuckoomix(key ^ CUCKOO_SEED2) %
-                          CUCKOO_BUCKET_COUNT);
+    buckets[0] = cuckoohash1(key);
+    buckets[1] = cuckoohash2(key);
 }
 
 static inline int cuckoocontains(const uint64_t *keys, uint64_t key)
@@ -89,9 +103,8 @@ static inline int cuckoocontains(const uint64_t *keys, uint64_t key)
     if (keys == NULL) return 0;
     if (key == 0) return (int)keys[CUCKOO_SLOT_COUNT];
     for (size_t choice = 0; choice < 2U; ++choice) {
-        uint64_t seed = choice == 0U ? CUCKOO_SEED1 : CUCKOO_SEED2;
-        size_t start = (size_t)(cuckoomix(key ^ seed) %
-                                CUCKOO_BUCKET_COUNT) * CUCKOO_BUCKET_SIZE;
+        size_t bucket = choice == 0U ? cuckoohash1(key) : cuckoohash2(key);
+        size_t start = bucket * CUCKOO_BUCKET_SIZE;
         for (size_t offset = 0; offset < CUCKOO_BUCKET_SIZE; ++offset) {
             if (keys[start + offset] == key) return 1;
         }
@@ -168,4 +181,4 @@ static inline int cuckooinsert(uint64_t *keys, uint64_t key)
     return cuckoorelocate(keys, key, buckets);
 }
 
-#endif /* YSEARCH5_CUCKOO_H */
+#endif /* CUCKOO_H */

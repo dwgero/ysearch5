@@ -12,6 +12,8 @@ _Static_assert(sizeof(infinite_keys) / sizeof(infinite_keys[0]) ==
                "generated table must reserve its entire metadata bucket");
 _Static_assert(INFINITE_KEY_CAPACITY == CUCKOO_SLOT_COUNT,
                "metadata must not increase the hashed slot capacity");
+_Static_assert(INFINITE_KEY_CUCKOO_VERSION == CUCKOO_HASH_VERSION,
+               "generated table must use the current cuckoo hash version");
 _Static_assert(INFINITE_KEY_COUNT ==
                ((HEADER_FIXTURE & 1U) != 0U ? 2U : 0U) +
                ((HEADER_FIXTURE & 2U) != 0U ? 1U : 0U),
